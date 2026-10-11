@@ -1,0 +1,49 @@
+--- a/webapp/channels/src/components/login/login.tsx
++++ b/webapp/channels/src/components/login/login.tsx
+@@ -187,7 +187,7 @@
+                 id: 'office365',
+                 url,
+                 icon: <EntraIdIcon/>,
+-                label: formatMessage({id: 'login.office365', defaultMessage: 'Entra ID'}),
++                label: formatMessage({id: 'login.office365', defaultMessage: 'Continue with Microsoft'}),
+                 onClick: handleExternalAuth(url, 'office365'),
+             });
+         }
+@@ -199,7 +199,6 @@
+                 url,
+                 icon: <LoginGoogleIcon/>,
+                 label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+-                style: {color: OpenIdButtonColor, borderColor: OpenIdButtonColor},
+                 onClick: handleExternalAuth(url, 'openid'),
+             });
+         }
+--- a/webapp/channels/src/components/signup/signup.tsx
++++ b/webapp/channels/src/components/signup/signup.tsx
+@@ -184,7 +184,7 @@
+                 id: 'office365',
+                 url,
+                 icon: <EntraIdIcon/>,
+-                label: formatMessage({id: 'login.office365', defaultMessage: 'Entra ID'}),
++                label: formatMessage({id: 'login.office365', defaultMessage: 'Continue with Microsoft'}),
+                 onClick: desktopExternalAuth(url),
+             });
+         }
+@@ -196,7 +196,6 @@
+                 url,
+                 icon: <LoginGoogleIcon/>,
+                 label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+-                style: {color: OpenIdButtonColor, borderColor: OpenIdButtonColor},
+                 onClick: desktopExternalAuth(url),
+             });
+         }
+--- a/webapp/channels/src/i18n/en.json
++++ b/webapp/channels/src/i18n/en.json
+@@ -6001,7 +6001,7 @@
+   "login.noPassword": "Please enter your password",
+   "login.noUsername": "Please enter your username",
+   "login.noUsernameLdapUsername": "Please enter your username or {ldapUsername}",
+-  "login.office365": "Entra ID",
++  "login.office365": "Continue with Microsoft",
+   "login.openid": "Open ID",
+   "login.or": "or log in with",
+   "login.pageTitle": "Log in - {siteName}",
