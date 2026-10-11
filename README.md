@@ -2,12 +2,13 @@
 
 A minimally patched Mattermost Team Edition for internal + partner use:
 standards-compliant **OIDC single sign-on** (Google, Entra ID, or an identity
-broker in front of both), **restricted guest accounts**, and no free-tier nag —
-with the stock Mattermost interface untouched.
+broker in front of both), **restricted guest accounts**, **calls with group
+calls, recording and transcription**, and no free-tier nag — with the stock
+Mattermost interface untouched.
 
-Built from pinned upstream source (`upstream.env`, currently `v11.11.1`);
-only the patches in `patches/server/` are applied. No Enterprise code, no
-licence checks touched.
+Built from pinned upstream source (`upstream.env`, currently `v11.11.1`
+server + calls `v1.12.3`); only the patches in `patches/` are applied. No
+Enterprise code, no licence checks touched.
 
 ## Patches
 
@@ -17,12 +18,23 @@ licence checks touched.
 | `0002-oidc-login-buttons` | Exposes the OIDC button + text/color to the login page | Otherwise the provider has no visible button |
 | `0004/0005-guest-accounts` | Lifts the guest-accounts gate, incl. admin screens | Partner channels with restricted guests |
 | `0006-remove-licence-badges` | Removes the “Free Version” label + unsupported-version notice | Cosmetic; display strings only |
+| `0007-prepackaged-signature-optional` | Allows installing our unsigned calls bundle | Required to ship our own plugin build |
+| `0013-ignore-superseded-plugins` | Server ignores the stale official calls bundle in the base image | Our bundle replaces it without a removal fight |
 | `0014-openid-button-adaptive-icon` | Login/signup SSO button shows Google’s “G”, Entra’s mark, or the generic OpenID mark depending on the configured discovery endpoint | One provider serves one IdP at a time; the icon follows it |
+| `calls/0001-0009` | Calls plugin: group calls + video, recording, transcription, on-by-default | Partner voice/video; see Calls below |
 
 Deliberately **not** ported: fork branding + branded assets (we ship upstream
-artwork), user-limit lift, channel moderation, calls plugin, prepackaged
-signature bypass, agents defaults, empty-category hiding. Unlimited message
-history needs no patch: an unlicensed server returns no history limit.
+artwork), user-limit lift, channel moderation, agents defaults,
+empty-category hiding. Unlimited message history needs no patch: an unlicensed
+server returns no history limit.
+
+## Calls, recording, transcription
+
+The image ships our calls plugin build (`patches/calls/`, `CALLS_VERSION` in
+`upstream.env`): group calls in every channel, call recording to file storage,
+and transcription. Recording posts land in the channel; transcription
+delivery through an external transcriber worker is a separate deployment step
+(tracked as follow-up work, not part of this image).
 
 ## Build & release
 

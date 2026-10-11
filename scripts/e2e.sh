@@ -59,4 +59,20 @@ for i in 1 2 3; do
         || { echo "FAIL: user $i refused" >&2; exit 1; }
 done
 
-echo "PASS: server $ver up, 3 users created, no fork branding"
+echo "==> checking the calls plugin"
+# The output lists enabled plugins first, then disabled ones. The plugin starts
+# in the background, so give it a minute rather than racing it.
+enabled=""
+for _ in $(seq 1 20); do
+    enabled="$(mmctl plugin list | awk '/^Listing disabled/ {exit} {print}')"
+    grep -q "^com.mattermost.calls: Calls$" <<<"$enabled" && break
+    sleep 3
+done
+echo "$enabled"
+if ! grep -q "^com.mattermost.calls: Calls$" <<<"$enabled"; then
+    echo "--- plugin list" >&2; mmctl plugin list >&2 || true
+    echo "--- server log, plugin lines" >&2; docker logs "$RUN-mm" 2>&1 | grep -i "plugin\|calls" | tail -40 >&2
+    echo "FAIL: calls plugin is not enabled" >&2; exit 1
+fi
+
+echo "PASS: server $ver up, 3 users created, calls enabled, no fork branding"

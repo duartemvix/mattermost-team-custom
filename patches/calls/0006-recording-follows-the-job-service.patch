@@ -1,0 +1,52 @@
+diff --git a/server/configuration.go b/server/configuration.go
+index c6f07fc..ee98b97 100644
+--- a/server/configuration.go
++++ b/server/configuration.go
+@@ -687,11 +687,47 @@ func (p *Plugin) ConfigurationWillBeSaved(newCfg *model.Config) (*model.Config,
+ 	return nil, nil
+ }
+ 
++// adminHasChosen reports whether a setting was written by an administrator, as
++// opposed to filled in from the default declared in plugin.json. Keys are
++// lower cased in the stored configuration.
++func (p *Plugin) adminHasChosen(key string) bool {
++	cfg := p.API.GetConfig()
++	if cfg == nil {
++		return false
++	}
++
++	stored, ok := cfg.PluginSettings.Plugins[manifest.Id]
++	if !ok {
++		return false
++	}
++
++	_, ok = stored[key]
++
++	return ok
++}
++
+ func (p *Plugin) setOverrides(cfg *configuration) {
+ 	p.configEnvOverrides = p.applyEnvOverrides(cfg, "MM_CALLS")
+ 
+ 	cfg.AllowEnableCalls = model.NewPointer(true)
+ 
++	// Recording and transcription need a job service to run them, and that is
++	// the only reason they were ever a decision. So they follow it: configure
++	// one and both are on.
++	//
++	// This cannot live in SetDefaults. plugin.json declares both keys with a
++	// default of false, so the server fills them in before SetDefaults runs and
++	// they are never nil. Only a value an administrator actually stored should
++	// win over this, which is what adminHasChosen checks.
++	if cfg.getJobServiceURL() != "" {
++		if !p.adminHasChosen("enablerecordings") {
++			cfg.EnableRecordings = model.NewPointer(true)
++		}
++		if !p.adminHasChosen("enabletranscriptions") {
++			cfg.EnableTranscriptions = model.NewPointer(true)
++		}
++	}
++
+ 	if l := p.API.GetLicense(); l != nil && license.IsCloud(l) {
+ 		// On Cloud installations we want calls enabled in all channels so we
+ 		// override it since the plugin's default is now false.

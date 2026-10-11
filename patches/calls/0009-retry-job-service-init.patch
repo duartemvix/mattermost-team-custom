@@ -1,0 +1,43 @@
+diff --git a/server/activate.go b/server/activate.go
+index 0b93f70..8f1235f 100644
+--- a/server/activate.go
++++ b/server/activate.go
+@@ -138,12 +138,33 @@ func (p *Plugin) OnActivate() (retErr error) {
+ 
+ 	if p.licenseChecker.RecordingsAllowed() && cfg.recordingsEnabled() {
+ 		go func() {
+-			if err := p.initJobService(); err != nil {
+-				err = fmt.Errorf("failed to initialize job service: %w", err)
+-				p.LogError(err.Error())
+-				return
++			// On a fresh install the job service pulls the recorder and
++			// transcriber images while it handles the init request, which
++			// takes longer than the request is allowed to. The first attempt
++			// then fails even though the images do arrive, and without a retry
++			// recording stays broken ("Job service is not initialized") until
++			// the server restarts. The second attempt finds the images cached.
++			const attempts = 10
++			delay := 5 * time.Second
++			for i := 1; ; i++ {
++				err := p.initJobService()
++				if err == nil {
++					p.LogDebug("job service initialized successfully")
++					return
++				}
++				p.LogError("failed to initialize job service", "err", err.Error(), "attempt", i, "of", attempts)
++				if i >= attempts {
++					return
++				}
++				select {
++				case <-time.After(delay):
++				case <-p.stopCh:
++					return
++				}
++				if delay < time.Minute {
++					delay *= 2
++				}
+ 			}
+-			p.LogDebug("job service initialized successfully")
+ 		}()
+ 	}
+ 

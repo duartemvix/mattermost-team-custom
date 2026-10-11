@@ -1,0 +1,51 @@
+diff --git a/webapp/src/components/admin_console_settings/common.tsx b/webapp/src/components/admin_console_settings/common.tsx
+index 647d562..2d045dd 100644
+--- a/webapp/src/components/admin_console_settings/common.tsx
++++ b/webapp/src/components/admin_console_settings/common.tsx
+@@ -3,7 +3,6 @@
+ 
+ import React, {ReactNode} from 'react';
+ import GenericModal from 'src/components/generic_modal';
+-import CompassIcon from 'src/components/icons/compassIcon';
+ import styled from 'styled-components';
+ 
+ export const leftCol = 'col-sm-4';
+@@ -17,34 +16,10 @@ export const Label = styled.span`
+     margin-right: 8px;
+ `;
+ 
+-export const EnterprisePill = ({children}: {children: ReactNode}) => (
+-    <Enterprise>
+-        <CompassIcon icon={'key-variant'}/>
+-        {children}
+-    </Enterprise>
+-);
+-
+-const Enterprise = styled.div`
+-    position: relative;
+-    display: flex;
+-    align-items: center;
+-    padding: 2px 6px 2px 2px;
+-    border-radius: 4px;
+-    height: 20px;
+-    gap: 1px;  // compass-icons have a 2.4px horizontal margin
+-
+-    font-family: 'Open Sans', sans-serif;
+-    font-size: 12px;
+-    font-weight: 600;
+-    line-height: 16px;
+-
+-    background: rgba(var(--button-bg-rgb), 0.12);
+-    color: var(--button-bg);
+-
+-    >i {
+-        font-size: 12px;
+-    }
+-`;
++// Nothing here is enterprise-only any more, so the pill renders nothing. It
++// stays as a component rather than being deleted at every call site, which
++// keeps this patch small when upstream moves the sections around.
++export const EnterprisePill = (_props: {children: ReactNode}) => null;
+ 
+ export const LeftBox = styled.div`
+     display: flex;

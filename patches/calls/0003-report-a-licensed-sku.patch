@@ -1,0 +1,22 @@
+diff --git a/webapp/src/selectors.ts b/webapp/src/selectors.ts
+index 218c4bb..9739171 100644
+--- a/webapp/src/selectors.ts
++++ b/webapp/src/selectors.ts
+@@ -578,11 +578,12 @@ export const callsUserPreferences = (state: GlobalState): CallsUserPreferences =
+ export const shouldPlayJoinUserSound = (state: GlobalState): boolean =>
+     profilesInCurrentCall(state).length < callsUserPreferences(state).joinSoundParticipantsThreshold;
+ 
+-export const isOnPremNotEnterprise = (state: GlobalState): boolean => {
+-    const license = getLicense(state);
+-    const enterprise = license.SkuShortName === LicenseSkus.Enterprise || license.SkuShortName === LicenseSkus.EntepriseAdvanced;
+-    return !isCloud(state) && !enterprise;
+-};
++// Mattermore: every feature this used to restrict (recordings, transcriptions,
++// live captions, rtcd) is served by open source components and its server-side
++// licence gate is already lifted, so nothing is enterprise-only on premise any
++// more. Returning false renders the real admin fields instead of an upsell.
++// See https://mattermore.dev/licensing
++export const isOnPremNotEnterprise = (_state: GlobalState): boolean => false;
+ 
+ export const isAtLeastProfessional = (state: GlobalState): boolean => {
+     const sku = callsConfig(state).sku_short_name;

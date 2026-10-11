@@ -1,0 +1,50 @@
+diff --git a/server/channels/app/plugin.go b/server/channels/app/plugin.go
+index b9792215..437c12c6 100644
+--- a/server/channels/app/plugin.go
++++ b/server/channels/app/plugin.go
+@@ -900,6 +900,34 @@ func (ch *Channels) getPluginsFromFilePaths(fileStorePaths []string) map[string]
+ //
+ // If enabled, prepackaged plugins are installed or upgraded locally. A list of transitionally
+ // prepackaged plugins is also collected for later persistence to the filestore.
++// skipPrepackagedPlugin reports whether a prepackaged bundle should be ignored
++// because Mattermore ships its own build of that plugin.
++//
++// The image cannot simply delete the bundle it replaces. The Team Edition base
++// image has no shell, so there is nothing to run rm with, and COPY merges into
++// the destination rather than replacing it, so a file that exists in the base
++// layer survives. Two bundles for one plugin id is not harmless: the server
++// installs one, then has to remove it again to install the other, and that
++// removal can fail and leave the plugin uninstalled entirely.
++//
++// MM_PREPACKAGED_PLUGINS_SKIP holds a comma separated list of filename
++// prefixes to ignore. Unset, which is upstream's default, changes nothing.
++func skipPrepackagedPlugin(name string) bool {
++	skip := os.Getenv("MM_PREPACKAGED_PLUGINS_SKIP")
++	if skip == "" {
++		return false
++	}
++
++	for _, prefix := range strings.Split(skip, ",") {
++		prefix = strings.TrimSpace(prefix)
++		if prefix != "" && strings.HasPrefix(name, prefix) {
++			return true
++		}
++	}
++
++	return false
++}
++
+ func (ch *Channels) processPrepackagedPlugins(prepackagedPluginsDir string) error {
+ 	logger := ch.srv.Log()
+ 	logger.Info("Processing prepackaged plugin")
+@@ -917,6 +945,10 @@ func (ch *Channels) processPrepackagedPlugins(prepackagedPluginsDir string) erro
+ 
+ 	var fileStorePaths []string
+ 	err := filepath.Walk(prepackagedPluginsPath, func(walkPath string, info os.FileInfo, err error) error {
++		if skipPrepackagedPlugin(filepath.Base(walkPath)) {
++			logger.Debug("Ignoring superseded prepackaged plugin", mlog.String("bundle_path", walkPath))
++			return nil
++		}
+ 		fileStorePaths = append(fileStorePaths, walkPath)
+ 		return nil
+ 	})

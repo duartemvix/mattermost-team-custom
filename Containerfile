@@ -1,11 +1,12 @@
 # Custom Mattermost Team Edition image.
 #
-# Built on the official Team Edition image for the pinned release. Three
+# Built on the official Team Edition image for the pinned release. Four
 # things change: the server binary (OIDC provider, guests, badge removal),
 # the web app (guest screens, badge removal, adaptive OIDC button icon),
-# and the config defaults below.
+# the calls plugin (group calls, recording, transcription), and the config
+# defaults below.
 
-ARG BASE_TAG=v11.11.1
+ARG BASE_TAG=11.11.1
 FROM docker.io/mattermost/mattermost-team-edition:${BASE_TAG} AS upstream
 
 # The guest administration screens and the licence badges live in the web app,
@@ -50,11 +51,26 @@ COPY --chown=2000:2000 mattermost-server /mattermost/bin/mattermost
 COPY --from=webapp --chown=2000:2000 /out /mattermost/client
 COPY --from=config --chown=2000:2000 --chmod=600 /out.json /mattermost/config/config.json
 
-# Playbooks ships prepackaged and then refuses to activate without a
-# Professional licence, so all it contributes is an error on every start.
-ENV MM_PREPACKAGED_PLUGINS_SKIP=mattermost-plugin-playbooks-
+
+# Our own calls bundle. Upstream's cannot be deleted from here: the base
+# image has no shell to run rm with, and COPY merges into the destination
+# rather than replacing it, so a file in the base layer survives. Two bundles
+# for one plugin id is not harmless, because the server installs one and then
+# has to remove it again to install the other, and that removal can fail and
+# leave the plugin uninstalled entirely.
+#
+# patches/server/0013 teaches the server to ignore the superseded official
+# bundle instead.
+COPY --chown=2000:2000 custom-calls.tar.gz /mattermost/prepackaged_plugins/custom-calls-linux-amd64.tar.gz
+# Playbooks ships prepackaged and then refuses to activate, because it wants
+# a Professional licence. It has never worked here, so all it contributes is
+# an error on every start.
+ENV MM_PREPACKAGED_PLUGINS_SKIP=mattermost-plugin-calls-,mattermost-plugin-playbooks-
+
+# Group calls are switched on by upstream's own environment variable.
+ENV MM_CALLS_GROUP_CALLS_ALLOWED=true
 
 LABEL org.opencontainers.image.title="Custom Mattermost Team Edition" \
-      org.opencontainers.image.description="Mattermost Team Edition with OIDC SSO, guests and no free-tier nag" \
+      org.opencontainers.image.description="Mattermost Team Edition with OIDC SSO, guests, calls and no free-tier nag" \
       org.opencontainers.image.source="https://github.com/duartemvix/mattermost-team-custom" \
       org.opencontainers.image.licenses="AGPL-3.0-only"

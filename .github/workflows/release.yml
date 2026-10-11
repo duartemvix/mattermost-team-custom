@@ -10,6 +10,34 @@ permissions:
   packages: write
 
 jobs:
+  plugin:
+    name: calls plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: grep -E '^[A-Z_]+=' upstream.env >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - run: ./scripts/build-calls.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calls-plugin
+          path: dist/*
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Calls plugin bundle built from upstream `${{ steps.pin.outputs.CALLS_TAG }}`
+            with group calls, recording and transcription patches.
+
+            Set `MM_CALLS_GROUP_CALLS_ALLOWED=true` on the server (the Docker
+            image already does), then upload the bundle in System Console >
+            Plugins > Plugin Management if you run it outside the image.
+
   image:
     name: server image
     runs-on: ubuntu-latest

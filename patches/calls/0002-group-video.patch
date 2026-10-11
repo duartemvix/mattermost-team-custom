@@ -1,0 +1,1537 @@
+diff --git a/standalone/src/init.ts b/standalone/src/init.ts
+index 07ec43a..c847725 100644
+--- a/standalone/src/init.ts
++++ b/standalone/src/init.ts
+@@ -56,7 +56,6 @@ import {DesktopNotificationArgs, Store, WebAppUtils} from 'plugin/types/mattermo
+ import {
+     getPluginPath,
+     getWSConnectionURL,
+-    isDMChannel,
+     setCallsGlobalCSSVars,
+ } from 'plugin/utils';
+ import {
+@@ -244,7 +243,7 @@ export default async function init(cfg: InitConfig) {
+         enableAV1: callsConfig(store.getState()).EnableAV1,
+         dcSignaling: callsConfig(store.getState()).EnableDCSignaling,
+         dcLocking: hasDCSignalingLockSupport(callsVersionInfo(store.getState())),
+-        enableVideo: callsConfig(store.getState()).EnableVideo && isDMChannel(channel),
++        enableVideo: callsConfig(store.getState()).EnableVideo,
+     };
+ 
+     connectCall(joinData, clientConfig, (ev) => {
+diff --git a/webapp/src/client.test.ts b/webapp/src/client.test.ts
+index 9241396..2d16bef 100644
+--- a/webapp/src/client.test.ts
++++ b/webapp/src/client.test.ts
+@@ -564,4 +564,178 @@ describe('CallsClient', () => {
+             expect(newTrack.stop).toHaveBeenCalledTimes(1);
+         });
+     });
++
++    describe('remote video streams', () => {
++        const originalMediaStream = global.MediaStream;
++
++        beforeEach(() => {
++            // jsdom has no MediaStream, and we only ever ask it for its tracks.
++            // @ts-ignore - minimal stand-in for the test
++            global.MediaStream = class {
++                private tracks: MediaStreamTrack[];
++
++                constructor(tracks: MediaStreamTrack[] = []) {
++                    this.tracks = tracks;
++                }
++
++                getVideoTracks() {
++                    return this.tracks;
++                }
++            };
++        });
++
++        afterEach(() => {
++            // @ts-ignore - restoring whatever was there (usually undefined)
++            global.MediaStream = originalMediaStream;
++        });
++
++        const makeTrack = (id: string, readyState = 'live') => ({
++            id,
++            kind: 'video',
++            readyState,
++            addEventListener: jest.fn(),
++        } as unknown as MediaStreamTrack);
++
++        const makeTransceiver = (mid: string, track: MediaStreamTrack, currentDirection = 'recvonly') => {
++            return {mid, currentDirection, receiver: {track}};
++        };
++
++        // Stands in for the RTCPeer bits we reach into: the peer connection whose
++        // transceivers carry the tracks and their SFU-assigned IDs.
++        const setupPeer = (transceivers: unknown[], mediaMap = {}) => {
++            const peer = {
++                pc: {getTransceivers: () => transceivers, ontrack: null},
++                mediaMap,
++            };
++
++            // @ts-ignore - accessing private property for testing
++            client.peer = peer;
++
++            return peer;
++        };
++
++        const sync = () => {
++            // @ts-ignore - accessing private method for testing
++            client.syncRemoteVideoStreams();
++        };
++
++        const emitted = (event: string) => {
++            return (client.emit as jest.Mock).mock.calls.filter((call) => call[0] === event);
++        };
++
++        it('keys a stream by the session ID embedded in the SFU track ID', () => {
++            setupPeer([makeTransceiver('0', makeTrack('video_sessiona_abcd1234'))]);
++
++            sync();
++
++            expect(emitted('remoteVideoStream')).toHaveLength(1);
++            expect(emitted('remoteVideoStream')[0][2]).toBe('sessiona');
++            expect([...client.getRemoteVideoStreams().keys()]).toEqual(['sessiona']);
++        });
++
++        it('re-keys to the new sender when the SFU reuses a transceiver', () => {
++            const transceiver = makeTransceiver('0', makeTrack('video_sessiona_abcd1234'));
++            setupPeer([transceiver]);
++
++            sync();
++
++            // Same mid, new track from a different sender.
++            transceiver.receiver.track = makeTrack('video_sessionb_efgh5678');
++
++            sync();
++
++            expect(emitted('remoteVideoStreamRemoved').map((call) => call[1])).toEqual(['sessiona']);
++            expect(emitted('remoteVideoStream').map((call) => call[2])).toEqual(['sessiona', 'sessionb']);
++            expect([...client.getRemoteVideoStreams().keys()]).toEqual(['sessionb']);
++        });
++
++        it('drops a stream once its transceiver stops receiving', () => {
++            const transceiver = makeTransceiver('0', makeTrack('video_sessiona_abcd1234'));
++            setupPeer([transceiver]);
++
++            sync();
++            transceiver.currentDirection = 'inactive';
++            sync();
++
++            expect(emitted('remoteVideoStreamRemoved').map((call) => call[1])).toEqual(['sessiona']);
++            expect(client.getRemoteVideoStreams().size).toBe(0);
++        });
++
++        it('ignores screen tracks, unparseable IDs and ended tracks', () => {
++            setupPeer([
++                makeTransceiver('0', makeTrack('screen_sessiona_abcd1234')),
++                makeTransceiver('1', makeTrack('some-random-track-id')),
++                makeTransceiver('2', makeTrack('video_sessionc_ijkl9012', 'ended')),
++            ]);
++
++            sync();
++
++            expect(emitted('remoteVideoStream')).toHaveLength(0);
++            expect(client.getRemoteVideoStreams().size).toBe(0);
++        });
++
++        it('keeps multiple senders apart and does not re-emit unchanged ones', () => {
++            const transceivers = [makeTransceiver('0', makeTrack('video_sessiona_abcd1234'))];
++            setupPeer(transceivers);
++
++            sync();
++            transceivers.push(makeTransceiver('1', makeTrack('video_sessionb_efgh5678')));
++            sync();
++
++            expect(emitted('remoteVideoStream').map((call) => call[2])).toEqual(['sessiona', 'sessionb']);
++            expect(emitted('remoteVideoStreamRemoved')).toHaveLength(0);
++            expect([...client.getRemoteVideoStreams().keys()]).toEqual(['sessiona', 'sessionb']);
++        });
++
++        it('registers a track from the peer connection track event', () => {
++            const track = makeTrack('video_sessiona_abcd1234');
++            setupPeer([makeTransceiver('0', track)]);
++
++            // @ts-ignore - accessing private method for testing
++            client.registerRemoteTrack({
++                track,
++                transceiver: {mid: '0'},
++                streams: [{id: 'sessiona'}],
++            } as unknown as RTCTrackEvent);
++
++            expect(emitted('remoteVideoStream').map((call) => call[2])).toEqual(['sessiona']);
++        });
++
++        // The SFU recycles the transceiver we opened for our own camera. The
++        // receiver track on it was created by the browser, so it carries a UUID
++        // rather than an SFU track name and only the msid identifies the sender.
++        it('falls back to the msid and the media map when the track ID is a browser UUID', () => {
++            const track = makeTrack('4b7e2a4c-0f3f-4f4a-9c2e-9b3f1d2a5c11');
++            setupPeer([makeTransceiver('1', track)], {1: {type: 'video', sender_id: 'ourselves'}});
++
++            // @ts-ignore - accessing private method for testing
++            client.registerRemoteTrack({
++                track,
++                transceiver: {mid: '1'},
++                streams: [{id: 'sessiond'}],
++            } as unknown as RTCTrackEvent);
++
++            expect(emitted('remoteVideoStream').map((call) => call[2])).toEqual(['sessiond']);
++
++            // A later sweep must not lose the attribution the track event recorded.
++            sync();
++            expect([...client.getRemoteVideoStreams().keys()]).toEqual(['sessiond']);
++            expect(emitted('remoteVideoStreamRemoved')).toHaveLength(0);
++        });
++
++        it('does not re-emit a stream when the same track fires ontrack twice', () => {
++            const track = makeTrack('video_sessiona_abcd1234');
++            setupPeer([makeTransceiver('0', track)]);
++
++            const ev = {track, transceiver: {mid: '0'}, streams: [{id: 'sessiona'}]} as unknown as RTCTrackEvent;
++
++            // @ts-ignore - accessing private method for testing
++            client.registerRemoteTrack(ev);
++            // @ts-ignore - accessing private method for testing
++            client.registerRemoteTrack(ev);
++
++            expect(emitted('remoteVideoStream')).toHaveLength(1);
++            expect(emitted('remoteVideoStreamRemoved')).toHaveLength(0);
++        });
++    });
+ });
+diff --git a/webapp/src/client.ts b/webapp/src/client.ts
+index d987eae..1e80949 100644
+--- a/webapp/src/client.ts
++++ b/webapp/src/client.ts
+@@ -49,6 +49,45 @@ export const DefaultVideoTrackOptions: MediaTrackConstraints = {
+ 
+ const rtcMonitorInterval = 10000;
+ 
++// How often we re-derive the remote video stream map. Most changes arrive as a
++// track event, but a transceiver going inactive after a sender leaves only shows
++// up in the connection state, so we sweep periodically as well.
++const remoteTracksSyncInterval = 1000;
++
++// The SFU names every track it forwards `<type>_<sender session ID>_<random>`
++// and uses the sender's session ID as the stream (msid) ID. See
++// rtcd service/rtc/utils.go genTrackID and sfu.go NewTrackLocalStaticRTP.
++//
++// Those two are the only trustworthy attribution we get. The MediaMap data
++// channel message looks like it should serve, but rtcd fills its sender_id field
++// with `s.cfg.SessionID`, which is the *receiving* session
++// (service/rtc/session.go sendMediaMapping). Reading it makes every remote track
++// look like it came from ourselves, so all of them collapse onto one key. Its
++// `type` field is sound, and is the only place a track type is stated once the
++// track ID goes stale.
++const parseRemoteTrackID = (trackID: string) => {
++    const fields = trackID.split('_');
++    if (fields.length !== 3 || !fields[0] || !fields[1]) {
++        return null;
++    }
++    return {type: fields[0], sessionID: fields[1]};
++};
++
++// Internals of RTCPeer we need to reach into: the peer connection, so we can
++// observe transceivers and wrap the track handler, and the media map, whose
++// `type` field is sound even though its `sender_id` is not.
++type RTCPeerInternals = {
++    pc: RTCPeerConnection | null;
++    mediaMap: {[mid: string]: {type: string, sender_id: string}};
++};
++
++type RemoteTrackRecord = {
++    type: string;
++    sessionID: string;
++    track: MediaStreamTrack;
++    stream: MediaStream;
++};
++
+ export default class CallsClient extends EventEmitter {
+     public channelID: string;
+     private readonly config: CallsClientConfig;
+@@ -58,7 +97,17 @@ export default class CallsClient extends EventEmitter {
+     public localVideoStream: MediaStream | null = null;
+     private remoteScreenTrack: MediaStreamTrack | null = null;
+     private remoteVoiceTracks: MediaStreamTrack[];
+-    private remoteVideoTracks: MediaStreamTrack[];
++
++    // Remote tracks keyed by the transceiver mid that delivers them. A mid
++    // outlives any single sender since the SFU reuses transceivers, so the record
++    // is refreshed on every track event.
++    private remoteTracksByMid: Map<string, RemoteTrackRecord>;
++
++    // Remote camera streams keyed by the session ID of the sender, derived from
++    // the track IDs the SFU assigns.
++    private remoteVideoStreams: Map<string, MediaStream>;
++
++    private remoteTracksSyncID: ReturnType<typeof setInterval> | null = null;
+     public currentAudioInputDevice: MediaDeviceInfo | null = null;
+     public currentAudioOutputDevice: MediaDeviceInfo | null = null;
+     public currentVideoInputDevice: MediaDeviceInfo | null = null;
+@@ -101,7 +150,8 @@ export default class CallsClient extends EventEmitter {
+         this.videoSenderTrackID = '';
+         this.streams = [];
+         this.remoteVoiceTracks = [];
+-        this.remoteVideoTracks = [];
++        this.remoteTracksByMid = new Map();
++        this.remoteVideoStreams = new Map();
+         this.stream = null;
+         this.audioDevices = {inputs: [], outputs: []};
+         this.videoDevices = [];
+@@ -542,6 +592,8 @@ export default class CallsClient extends EventEmitter {
+ 
+             this.peer = peer;
+ 
++            this.observeRemoteTracks(peer);
++
+             this.collectICEStats();
+ 
+             this.rtcMonitor = new RTCMonitor({
+@@ -615,9 +667,11 @@ export default class CallsClient extends EventEmitter {
+                 // Handle video tracks based on type
+                 if (videoTracks.length > 0) {
+                     if (trackInfo?.type === 'video') {
+-                        logDebug('received video track, emitting as remoteVideoStream');
+-                        this.emit('remoteVideoStream', remoteStream);
+-                        this.remoteVideoTracks.push(videoTracks[0]);
++                        // Attribution and stream bookkeeping happen in the track handler
++                        // we install on the peer connection, which is the only place with
++                        // access to the transceiver and the msid.
++                        logDebug('received video track, syncing remote video streams');
++                        this.syncRemoteVideoStreams();
+                     } else if (trackInfo?.type === 'screen') {
+                         logDebug('received screen track, emitting as remoteScreenStream');
+                         this.emit('remoteScreenStream', remoteStream);
+@@ -667,6 +721,8 @@ export default class CallsClient extends EventEmitter {
+         this.removeAllListeners('connect');
+         this.removeAllListeners('remoteVoiceStream');
+         this.removeAllListeners('remoteScreenStream');
++        this.removeAllListeners('remoteVideoStream');
++        this.removeAllListeners('remoteVideoStreamRemoved');
+         this.removeAllListeners('localScreenStream');
+         this.removeAllListeners('localVideoStream');
+         this.removeAllListeners('devicechange');
+@@ -683,6 +739,12 @@ export default class CallsClient extends EventEmitter {
+         this.removeAllListeners('video_off');
+         window.removeEventListener('beforeunload', this.onBeforeUnload);
+         navigator.mediaDevices?.removeEventListener('devicechange', this.onDeviceChange);
++        if (this.remoteTracksSyncID) {
++            clearInterval(this.remoteTracksSyncID);
++            this.remoteTracksSyncID = null;
++        }
++        this.remoteVideoStreams.clear();
++        this.remoteTracksByMid.clear();
+         this.segmenter?.stop();
+         this.segmenter = null;
+         persistClientLogs();
+@@ -958,11 +1020,146 @@ export default class CallsClient extends EventEmitter {
+         return new MediaStream([this.remoteScreenTrack]);
+     }
+ 
+-    public getRemoteVideoStream(): MediaStream|null {
+-        if (this.remoteVideoTracks.length < 1 || this.remoteVideoTracks[this.remoteVideoTracks.length - 1].readyState !== 'live') {
+-            return null;
++    public getRemoteVideoStreams(): Map<string, MediaStream> {
++        return new Map(this.remoteVideoStreams);
++    }
++
++    // RTCPeer owns pc.ontrack, and the track event is the only place where the
++    // transceiver, the track and the msid are all available at once. We wrap the
++    // handler rather than replace it so RTCPeer keeps emitting 'stream' as usual.
++    private observeRemoteTracks(peer: RTCPeer) {
++        const pc = (peer as unknown as RTCPeerInternals).pc;
++        if (!pc) {
++            logErr('client: no peer connection to observe remote tracks on');
++            return;
++        }
++
++        const original = pc.ontrack;
++        pc.ontrack = (ev: RTCTrackEvent) => {
++            try {
++                this.registerRemoteTrack(ev);
++            } catch (err) {
++                logErr('client: failed to register remote track', err);
++            }
++            original?.call(pc, ev);
++        };
++
++        // A sender leaving flips its transceiver to inactive without firing a track
++        // event, so we sweep as well as react.
++        this.remoteTracksSyncID = setInterval(() => this.syncRemoteVideoStreams(), remoteTracksSyncInterval);
++    }
++
++    private registerRemoteTrack(ev: RTCTrackEvent) {
++        const {track, transceiver} = ev;
++        const mid = transceiver?.mid;
++        if (!mid) {
++            logWarn('client: remote track with no mid', track.id);
++            return;
++        }
++
++        // The msid is re-read from the SDP on every negotiation, so it is the
++        // freshest statement of who owns this track. The track ID is fixed when the
++        // browser creates the receiver track and goes stale as soon as the SFU
++        // recycles the transceiver for another sender, so it is only a fallback.
++        // It is also a browser-generated UUID, carrying nothing, on the transceiver
++        // we opened for our own camera and the SFU then recycled.
++        const parsed = parseRemoteTrackID(track.id);
++        const mediaMap = (this.peer as unknown as RTCPeerInternals | null)?.mediaMap;
++        const sessionID = ev.streams[0]?.id || parsed?.sessionID || '';
++        const type = mediaMap?.[mid]?.type || parsed?.type || '';
++
++        if (!sessionID || !type) {
++            logWarn('client: unable to attribute remote track', track.id, 'mid', mid, 'msid', ev.streams[0]?.id);
++            return;
++        }
++
++        logDebug('client: remote track', track.id, 'mid', mid, 'msid', ev.streams[0]?.id, 'type', type, 'sender', sessionID);
++
++        const existing = this.remoteTracksByMid.get(mid);
++        this.remoteTracksByMid.set(mid, {
++            type,
++            sessionID,
++
++            // Keep the stream object while both the track and its owner are
++            // unchanged: handing out a fresh MediaStream makes every consumer tear
++            // its video element down and build it again.
++            stream: existing?.track === track && existing.sessionID === sessionID ? existing.stream : new MediaStream([track]),
++            track,
++        });
++
++        if (existing?.track !== track) {
++            for (const event of ['ended', 'mute', 'unmute']) {
++                track.addEventListener(event, () => this.syncRemoteVideoStreams());
++            }
++        }
++
++        this.syncRemoteVideoStreams();
++    }
++
++    // Recomputes the session ID -> stream mapping from the live transceivers and
++    // emits the difference. A sender swapping onto a recycled transceiver is
++    // handled like any other change since everything is keyed by mid.
++    private syncRemoteVideoStreams() {
++        const internals = this.peer as unknown as RTCPeerInternals | null;
++        const pc = internals?.pc;
++        if (!pc) {
++            return;
++        }
++
++        const streams = new Map<string, MediaStream>();
++        for (const transceiver of pc.getTransceivers()) {
++            const {mid, currentDirection} = transceiver;
++            if (!mid || (currentDirection !== 'sendrecv' && currentDirection !== 'recvonly')) {
++                continue;
++            }
++
++            const track = transceiver.receiver?.track;
++            if (!track || track.kind !== 'video' || track.readyState === 'ended') {
++                continue;
++            }
++
++            // Attribution is decided in the track handler, which is the only place
++            // with the msid. The parsed track ID stands in should a track ever reach
++            // a transceiver without one.
++            const record = this.remoteTracksByMid.get(mid);
++            const parsed = parseRemoteTrackID(track.id);
++            const sessionID = record?.track === track ? record.sessionID : parsed?.sessionID;
++            if (!sessionID) {
++                continue;
++            }
++
++            // The type can change under a recycled mid (camera out, screen in), and
++            // the media map is where that shows up.
++            const type = internals?.mediaMap?.[mid]?.type || record?.type || parsed?.type;
++            if (type !== 'video') {
++                continue;
++            }
++
++            let stream = record?.stream;
++            if (!record || record.track !== track || record.sessionID !== sessionID) {
++                stream = new MediaStream([track]);
++                this.remoteTracksByMid.set(mid, {type, sessionID, track, stream});
++            }
++
++            streams.set(sessionID, stream!);
++        }
++
++        for (const [sessionID, stream] of this.remoteVideoStreams) {
++            if (streams.get(sessionID) !== stream) {
++                logDebug('client: removing remote video stream for session', sessionID);
++                this.remoteVideoStreams.delete(sessionID);
++                this.emit('remoteVideoStreamRemoved', sessionID);
++            }
++        }
++
++        for (const [sessionID, stream] of streams) {
++            if (this.remoteVideoStreams.get(sessionID) === stream) {
++                continue;
++            }
++            logDebug('client: emitting remote video stream for session', sessionID);
++            this.remoteVideoStreams.set(sessionID, stream);
++            this.emit('remoteVideoStream', stream, sessionID);
+         }
+-        return new MediaStream([this.remoteVideoTracks[this.remoteVideoTracks.length - 1]]);
+     }
+ 
+     public getRemoteVoiceTracks(): MediaStreamTrack[] {
+diff --git a/webapp/src/components/call_widget/component.test.tsx b/webapp/src/components/call_widget/component.test.tsx
+index 7d8446d..d3386b8 100644
+--- a/webapp/src/components/call_widget/component.test.tsx
++++ b/webapp/src/components/call_widget/component.test.tsx
+@@ -81,7 +81,6 @@ const props: Props = {
+     openModal: jest.fn(),
+     openCallsUserSettings: jest.fn(),
+     enableVideo: false,
+-    connectedDMUser: undefined,
+     isAdmin: false,
+ };
+ 
+@@ -98,6 +97,7 @@ describe('CallWidget', () => {
+             channelID: 'channel-id',
+             getRemoteVoiceTracks: () => [],
+             getRemoteScreenStream: () => null,
++            getRemoteVideoStreams: () => new Map(),
+             getLocalScreenStream: () => null,
+             on: jest.fn(),
+             off: jest.fn(),
+@@ -198,6 +198,7 @@ describe('leave button behavior', () => {
+             channelID: 'channel-id',
+             getRemoteVoiceTracks: () => [],
+             getRemoteScreenStream: () => null,
++            getRemoteVideoStreams: () => new Map(),
+             getLocalScreenStream: () => null,
+             on: jest.fn(),
+             off: jest.fn(),
+diff --git a/webapp/src/components/call_widget/component.tsx b/webapp/src/components/call_widget/component.tsx
+index 997db98..6184c05 100644
+--- a/webapp/src/components/call_widget/component.tsx
++++ b/webapp/src/components/call_widget/component.tsx
+@@ -51,7 +51,7 @@ import VideoOffIcon from 'src/components/icons/video_off';
+ import VideoOnIcon from 'src/components/icons/video_on';
+ import {CallIncomingCondensed} from 'src/components/incoming_calls/call_incoming_condensed';
+ import {LeaveCallMenu} from 'src/components/leave_call_menu';
+-import {JoinLoadingOverlay, VideoLoadingOverlay} from 'src/components/loading_overlays';
++import {JoinLoadingOverlay} from 'src/components/loading_overlays';
+ import {
+     CallAlertConfigs,
+     CallRecordingDisclaimerStrings,
+@@ -142,7 +142,6 @@ interface Props {
+     openModal: <P>(modalData: ModalData<P>) => void;
+     openCallsUserSettings: () => void;
+     enableVideo: boolean,
+-    connectedDMUser: UserProfile | undefined,
+     isAdmin: boolean,
+ }
+ 
+@@ -162,7 +161,7 @@ interface State {
+     screenStream: MediaStream | null,
+     selfVideoStream: MediaStream | null,
+     initializingSelfVideo: boolean,
+-    otherVideoStream: MediaStream | null,
++    remoteVideoStreams: {[sessionID: string]: MediaStream},
+     currentAudioInputDevice?: MediaDeviceInfo | null,
+     currentAudioOutputDevice?: MediaDeviceInfo | null,
+     currentVideoInputDevice?: MediaDeviceInfo | null,
+@@ -227,12 +226,6 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+                 alignItems: 'center',
+                 gap: '6px',
+             },
+-            videoContainer: {
+-                position: 'relative',
+-                display: 'flex',
+-                height: '140px',
+-                background: 'var(--calls-bg)',
+-            },
+             frame: {
+                 width: '100%',
+                 background: 'var(--center-channel-bg)',
+@@ -324,7 +317,7 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+             removeConfirmation: null,
+             leaveMenuOpen: false,
+             selfVideoStream: null,
+-            otherVideoStream: null,
++            remoteVideoStreams: {},
+             initializingSelfVideo: false,
+         };
+         this.node = React.createRef();
+@@ -531,10 +524,18 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+             });
+         });
+ 
+-        window.callsClient.on('remoteVideoStream', (stream: MediaStream) => {
+-            this.setState({
+-                otherVideoStream: stream,
+-            });
++        // Seed from whatever the client already has: sessions can start sending
++        // video before the widget mounts, and no event is re-emitted for those.
++        // eslint-disable-next-line react/no-did-mount-set-state
++        this.setState({
++            remoteVideoStreams: Object.fromEntries(window.callsClient.getRemoteVideoStreams()),
++        });
++
++        window.callsClient.on('remoteVideoStream', this.onRemoteVideoStream);
++        window.callsClient.on('remoteVideoStreamRemoved', this.onRemoteVideoStreamRemoved);
++        this.unsubscribers.push(() => {
++            window.callsClient?.off('remoteVideoStream', this.onRemoteVideoStream);
++            window.callsClient?.off('remoteVideoStreamRemoved', this.onRemoteVideoStreamRemoved);
+         });
+ 
+         window.callsClient.on('devicechange', (devices: MediaDevices, videoDevices: MediaDeviceInfo[]) => {
+@@ -722,8 +723,55 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+         if (this.screenPlayer && this.state.screenStream !== prevState.screenStream) {
+             this.screenPlayer.srcObject = this.state.screenStream;
+         }
++
++        this.pruneRemoteVideoStreams(prevProps);
+     }
+ 
++    onRemoteVideoStream = (stream: MediaStream, sessionID: string) => {
++        if (!sessionID) {
++            return;
++        }
++
++        this.setState((state) => ({
++            remoteVideoStreams: {...state.remoteVideoStreams, [sessionID]: stream},
++        }));
++    };
++
++    onRemoteVideoStreamRemoved = (sessionID: string) => {
++        this.setState((state) => {
++            if (!state.remoteVideoStreams[sessionID]) {
++                return null;
++            }
++
++            const remoteVideoStreams = {...state.remoteVideoStreams};
++            delete remoteVideoStreams[sessionID];
++            return {remoteVideoStreams};
++        });
++    };
++
++    // Streams are dropped from component state only once a session we have
++    // actually seen in the call goes away. We never touch the client map here: it
++    // is shared with the expanded view and a stream can legitimately arrive before
++    // its session lands in the store.
++    private pruneRemoteVideoStreams = (prevProps: Props) => {
++        const staleSessionIDs = Object.keys(this.state.remoteVideoStreams).filter((sessionID) => {
++            return prevProps.sessionsMap?.[sessionID] && !this.props.sessionsMap?.[sessionID];
++        });
++
++        if (staleSessionIDs.length === 0) {
++            return;
++        }
++
++        // eslint-disable-next-line react/no-did-update-set-state
++        this.setState((state) => {
++            const remoteVideoStreams = {...state.remoteVideoStreams};
++            for (const sessionID of staleSessionIDs) {
++                delete remoteVideoStreams[sessionID];
++            }
++            return {remoteVideoStreams};
++        });
++    };
++
+     private getGlobalWidgetBounds = () => {
+         const bounds = {
+             width: 0,
+@@ -2339,85 +2387,59 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+         );
+     };
+ 
+-    renderVideoContainer = () => {
+-        // Here we are assuming this only renders in a DM which is the case
+-        // right now.
+-        const selfProfile = this.props.profiles[this.props.currentUserID];
+-        const otherProfile = this.props.connectedDMUser;
+-        const otherSession = this.props.otherSessions.find((s) => s.video);
++    getCallSessions = () => {
++        return this.props.currentSession ? [...this.props.otherSessions, this.props.currentSession] : this.props.otherSessions;
++    };
+ 
+-        return (
+-            <div
+-                className='calls-widget-video-container'
+-                style={this.style.videoContainer}
+-            >
+-                { selfProfile && this.props.currentSession &&
+-                    <CallsDMVideoPlayer
+-                        stream={this.state.selfVideoStream}
+-                        profile={selfProfile}
+-                        hasVideo={Boolean(this.props.currentSession?.video) || this.state.initializingSelfVideo}
+-                        selfView={true}
+-                        selfOnly={this.props.otherSessions.length === 0}
+-                    />
+-                }
+-                { otherProfile && this.props.otherSessions.length !== 0 &&
+-                    <CallsDMVideoPlayer
+-                        stream={this.state.otherVideoStream}
+-                        profile={otherProfile}
+-                        hasVideo={Boolean(otherSession?.video)}
+-                        selfView={false}
+-                    />
+-                }
+-            </div>
+-        );
++    getSessionVideoStream = (session: UserSessionState) => {
++        if (session.session_id === this.props.currentSession?.session_id) {
++            return this.state.selfVideoStream;
++        }
++        return this.state.remoteVideoStreams[session.session_id] ?? null;
+     };
+ 
+     renderProfiles = () => {
+-        // Here we are assuming this only renders in a DM which is the case
+-        // right now.
+-        const selfProfile = this.props.profiles[this.props.currentUserID];
+-        const otherProfile = this.props.connectedDMUser;
+-        const otherSession = this.props.otherSessions[0];
+-        const selfSession = this.props.currentSession;
+-        const videoView = (otherSession?.video || selfSession?.video) ?? false;
++        const sessions = this.getCallSessions();
++        const videoView = sessions.some((session) => session.video) || this.state.initializingSelfVideo;
+         const selfOnly = this.props.otherSessions.length === 0;
++        const mirrorSelfVideo = localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true';
+ 
+         return (
+             <div
+                 className='calls-widget-profiles'
+                 style={{
+                     display: 'flex',
++                    flexWrap: 'wrap',
+                     gap: '8px',
+                     alignItems: 'center',
+                     justifyContent: 'center',
+                     width: '100%',
++                    maxHeight: '168px',
++                    overflowY: 'auto',
+                 }}
+             >
++                {sessions.map((session) => {
++                    const profile = this.props.profiles[session.user_id];
++                    if (!profile) {
++                        return null;
++                    }
+ 
+-                { otherProfile && otherSession &&
+-                <CallsWidgetProfile
+-                    videoStream={this.state.otherVideoStream}
+-                    profile={otherProfile}
+-                    isSpeaking={Boolean(otherSession.voice)}
+-                    isMuted={!otherSession.unmuted}
+-                    hasVideo={Boolean(otherSession.video)}
+-                    videoView={videoView}
+-                    mirrorVideo={false}
+-                />
+-                }
+-
+-                { selfProfile && selfSession &&
+-                <CallsWidgetProfile
+-                    videoStream={this.state.selfVideoStream}
+-                    profile={selfProfile}
+-                    isSpeaking={Boolean(selfSession.voice)}
+-                    isMuted={!selfSession.unmuted}
+-                    hasVideo={Boolean(selfSession.video)}
+-                    videoView={videoView}
+-                    mirrorVideo={localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true'}
+-                    singleSession={selfOnly}
+-                />
+-                }
++                    const isSelf = session.session_id === this.props.currentSession?.session_id;
++
++                    return (
++                        <CallsWidgetProfile
++                            key={session.session_id}
++                            videoStream={this.getSessionVideoStream(session)}
++                            profile={profile}
++                            isSpeaking={Boolean(session.voice)}
++                            isMuted={!session.unmuted}
++                            hasVideo={Boolean(session.video) || (isSelf && this.state.initializingSelfVideo)}
++                            videoView={videoView}
++                            mirrorVideo={isSelf && mirrorSelfVideo}
++                            singleSession={isSelf && selfOnly}
++                        />
++                    );
++                })}
+             </div>
+         );
+     };
+@@ -2499,8 +2521,6 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+         const settingsButtonLabel = formatMessage({defaultMessage: 'More options'});
+         const leaveMenuLabel = formatMessage({defaultMessage: 'Leave call'});
+ 
+-        // const shouldRenderVideoContainer = this.props.currentSession?.video || this.state.initializingSelfVideo || this.props.otherSessions.some((s) => s.video);
+-
+         return (
+             <div
+                 id='calls-widget'
+@@ -2584,8 +2604,6 @@ export default class CallWidget extends React.PureComponent<Props, State> {
+ 
+                     {this.props.enableVideo && this.renderTopBar() }
+ 
+-                    {/* {shouldRenderVideoContainer && this.renderVideoContainer()} */}
+-
+                     {this.props.enableVideo && this.renderMiddleBar() }
+ 
+                     <div
+@@ -2755,123 +2773,9 @@ const LeaveCallButton = styled(DotMenuButton)<{ $isActive: boolean }>`
+     }
+ `;
+ 
+-const VideoPlayerContainer = styled.div<{$selfView: boolean, $hasVideo: boolean, $selfOnly?: boolean}>`
+-  ${({$selfView}) => !$selfView && css`
+-      width: 100%;
+-      z-index: 0;
+-      display: flex;
+-      justify-content: center;
+-      align-items: center;
+-  `}
+-
+-  ${({$selfView}) => $selfView && css`
+-      width: 60px;
+-      height: 60px;
+-      border-radius: 8px;
+-      display: flex;
+-      justify-content: center;
+-      align-items: center;
+-      position: absolute;
+-      left: 4px;
+-      top: 4px;
+-      z-index: 1;
+-  `}
+-
+-  ${({$selfOnly}) => $selfOnly && css`
+-      width: 100%;
+-      height: 100%;
+-      top: 0;
+-      left: 0;
+-  `}
+-
+-  ${({$hasVideo}) => !$hasVideo && css`
+-      background: var(--calls-bg);
+-      border: 1px solid rgba(var(--center-channel-color-rgb), 0.8);
+-  `}
+-`;
+-
+-const VideoPlayer = styled.video<{$selfView: boolean, $mirror?: boolean, $selfOnly?: boolean}>`
+-   width: 100%;
+-   height: 100%;
+-   object-fit: cover;
+-
+-  ${({$selfView, $mirror}) => $selfView && $mirror && css`
+-    transform: scaleX(-1);
+-  `}
+-
+-  ${({$selfView, $selfOnly}) => $selfView && !$selfOnly && css`
+-    border-radius: 8px;
+-    box-shadow: rgba(0, 0, 0, 0.25) 0px 54px 55px, rgba(0, 0, 0, 0.12) 0px -12px 30px, rgba(0, 0, 0, 0.12) 0px 4px 6px, rgba(0, 0, 0, 0.17) 0px 12px 13px, rgba(0, 0, 0, 0.09) 0px -3px 5px;
+-  `}
+-`;
+-
+-type CallsDMVideoPlayerProps = {
+-    stream: MediaStream | null;
+-    profile: UserProfile;
+-    hasVideo: boolean;
+-    selfView: boolean;
+-    selfOnly?: boolean;
+-};
+-
+-const CallsDMVideoPlayer = (props: CallsDMVideoPlayerProps) => {
+-    const [isLoading, setIsLoading] = useState(true);
+-    const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+-
+-    const videoElRefCb = (el: HTMLVideoElement | null) => {
+-        if (el) {
+-            setVideoEl(el);
+-        }
+-    };
+-
+-    useEffect(() => {
+-        if (videoEl && props.stream) {
+-            videoEl.srcObject = props.stream;
+-        }
+-
+-        if (!props.hasVideo) {
+-            setIsLoading(true);
+-        }
+-    }, [props.stream, isLoading, videoEl, props.hasVideo]);
+-
+-    if (props.hasVideo) {
+-        return (
+-            <VideoPlayerContainer
+-                $selfView={props.selfView}
+-                $hasVideo={props.hasVideo}
+-                $selfOnly={props.selfOnly}
+-            >
+-                <VideoLoadingOverlay
+-                    visible={isLoading}
+-                    spinnerSize={props.selfView && !props.selfOnly ? 8 : 16}
+-                />
+-                <VideoPlayer
+-                    ref={videoElRefCb}
+-                    data-testid={`calls-widget-video-player-${props.selfView ? 'self' : 'other'}`}
+-                    onLoadedMetadata={() => setIsLoading(false)}
+-                    autoPlay={true}
+-                    muted={true}
+-                    $selfView={props.selfView}
+-                    $selfOnly={props.selfOnly}
+-                    $mirror={props.selfView && localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true'}
+-                />
+-            </VideoPlayerContainer>
+-        );
+-    }
+-    return (
+-        <VideoPlayerContainer
+-            $selfView={props.selfView}
+-            $hasVideo={props.hasVideo}
+-            data-testid={`calls-widget-video-placeholder-${props.selfView ? 'self' : 'other'}`}
+-        >
+-            <Avatar
+-                size={props.selfView ? 36 : 96}
+-                border={false}
+-                url={Client4.getProfilePictureUrl(props.profile.id, props.profile.last_picture_update)}
+-            />
+-        </VideoPlayerContainer>
+-    );
+-};
+-
++// Tiles hold a 40px avatar that cannot shrink, so they get a matching flex basis
++// and minimum instead of a zero basis, which would grind them down to slivers
++// once a handful of sessions share the row.
+ const WidgetProfileContainer = styled.div<{$videoView: boolean, $singleSession?: boolean}>`
+   display: flex;
+   position: relative;
+@@ -2879,7 +2783,8 @@ const WidgetProfileContainer = styled.div<{$videoView: boolean, $singleSession?:
+   align-items: center;
+   background: #E4EBFA;
+   border-radius: 4px;
+-  flex: 1;
++  flex: 1 1 48px;
++  min-width: 48px;
+ 
+   ${({$videoView, $singleSession}) => $videoView && !$singleSession && css`
+     aspect-ratio: 1;
+@@ -2929,6 +2834,10 @@ type CallsWidgetProfileProps = {
+ const CallsWidgetProfile = (props: CallsWidgetProfileProps) => {
+     const MuteIcon = props.isMuted ? MutedIcon : UnmutedIcon;
+ 
++    // A session can be flagged as sending video before its stream reaches us.
++    // Rendering an empty video element in that window would show a black tile.
++    const showVideo = props.hasVideo && Boolean(props.videoStream);
++
+     const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+     const videoElRefCb = (el: HTMLVideoElement | null) => {
+         if (el) {
+@@ -2948,7 +2857,7 @@ const CallsWidgetProfile = (props: CallsWidgetProfileProps) => {
+             $singleSession={props.singleSession}
+         >
+ 
+-            {!props.hasVideo &&
++            {!showVideo &&
+             <Avatar
+                 size={40}
+                 border={false}
+@@ -2958,7 +2867,7 @@ const CallsWidgetProfile = (props: CallsWidgetProfileProps) => {
+             />
+             }
+ 
+-            {props.hasVideo &&
++            {showVideo &&
+             <WidgetProfileVideoPlayer
+                 ref={videoElRefCb}
+                 autoPlay={true}
+diff --git a/webapp/src/components/call_widget/index.ts b/webapp/src/components/call_widget/index.ts
+index f0490d0..210aa98 100644
+--- a/webapp/src/components/call_widget/index.ts
++++ b/webapp/src/components/call_widget/index.ts
+@@ -4,7 +4,7 @@
+ import {GlobalState} from '@mattermost/types/store';
+ import {getChannel} from 'mattermost-redux/selectors/entities/channels';
+ import {getCurrentTeamId, getMyTeams, getTeam} from 'mattermost-redux/selectors/entities/teams';
+-import {getCurrentUserId, getUser, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
++import {getCurrentUserId, isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
+ import {injectIntl} from 'react-intl';
+ import {connect} from 'react-redux';
+ import {bindActionCreators, Dispatch} from 'redux';
+@@ -41,7 +41,7 @@ import {
+     threadIDForCallInChannel,
+     transcriptionsEnabled,
+ } from 'src/selectors';
+-import {alphaSortSessions, getUserIdFromDM, isDMChannel, stateSortSessions} from 'src/utils';
++import {alphaSortSessions, stateSortSessions} from 'src/utils';
+ import {modals} from 'src/webapp_globals';
+ 
+ import CallWidget from './component';
+@@ -65,12 +65,6 @@ const mapStateToProps = (state: GlobalState) => {
+ 
+     const callThreadID = threadIDForCallInChannel(state, channel?.id || '');
+ 
+-    let connectedDMUser;
+-    if (channel && isDMChannel(channel)) {
+-        const otherID = getUserIdFromDM(channel.name, currentUserID);
+-        connectedDMUser = getUser(state, otherID);
+-    }
+-
+     return {
+         currentUserID,
+         channel,
+@@ -97,8 +91,7 @@ const mapStateToProps = (state: GlobalState) => {
+         clientConnecting: clientConnecting(state),
+         callThreadID,
+         recordingsEnabled: recordingsEnabled(state),
+-        enableVideo: callsConfig(state).EnableVideo && isDMChannel(channel),
+-        connectedDMUser,
++        enableVideo: callsConfig(state).EnableVideo,
+         otherSessions: sessionsForOtherUsersInCall(state),
+         isAdmin: isCurrentUserSystemAdmin(state),
+     };
+diff --git a/webapp/src/components/expanded_view/component.tsx b/webapp/src/components/expanded_view/component.tsx
+index 0ac3ae3..d3df205 100644
+--- a/webapp/src/components/expanded_view/component.tsx
++++ b/webapp/src/components/expanded_view/component.tsx
+@@ -136,12 +136,16 @@ interface Props extends RouteComponentProps {
+ interface State {
+     screenStream: MediaStream | null,
+     selfVideoStream: MediaStream | null,
+-    otherVideoStream: MediaStream | null,
++    remoteVideoStreams: {[sessionID: string]: MediaStream},
+     showParticipantsList: boolean,
+     showLiveCaptions: boolean,
+     alerts: CallAlertStates,
+     removeConfirmation: RemoveConfirmationData | null,
+     viewState: 'grid' | 'speaker',
++
++    // Set once the user picks a view, after which we stop choosing one for them.
++    viewStatePinned: boolean,
++    activeSessionID: string,
+ }
+ 
+ const StyledMediaController = styled(MediaController)`
+@@ -290,12 +294,14 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+         this.state = {
+             screenStream: null,
+             selfVideoStream: null,
+-            otherVideoStream: null,
++            remoteVideoStreams: {},
+             showParticipantsList: false,
+             showLiveCaptions: false,
+             alerts: CallAlertStatesDefault,
+             removeConfirmation: null,
+             viewState: 'speaker',
++            viewStatePinned: false,
++            activeSessionID: '',
+         };
+ 
+         if (window.opener) {
+@@ -585,6 +591,29 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+     onSwitchViewClick = () => {
+         this.setState({
+             viewState: this.state.viewState === 'grid' ? 'speaker' : 'grid',
++            viewStatePinned: true,
++        });
++    };
++
++    onRemoteVideoStream = (stream: MediaStream, sessionID: string) => {
++        if (!sessionID) {
++            return;
++        }
++
++        this.setState((state) => ({
++            remoteVideoStreams: {...state.remoteVideoStreams, [sessionID]: stream},
++        }));
++    };
++
++    onRemoteVideoStreamRemoved = (sessionID: string) => {
++        this.setState((state) => {
++            if (!state.remoteVideoStreams[sessionID]) {
++                return null;
++            }
++
++            const remoteVideoStreams = {...state.remoteVideoStreams};
++            delete remoteVideoStreams[sessionID];
++            return {remoteVideoStreams};
+         });
+     };
+ 
+@@ -615,8 +644,77 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+         if (this.screenPlayer && this.state.screenStream !== prevState.screenStream) {
+             this.screenPlayer.srcObject = this.state.screenStream;
+         }
++
++        this.trackActiveSpeaker(prevProps);
++        this.pruneRemoteVideoStreams(prevProps);
++        this.pickDefaultViewState();
+     }
+ 
++    // Speaker view only makes sense with a single remote participant: with more
++    // than one it hides everybody but the active speaker behind a thumbnail
++    // strip. Group calls therefore open in grid view unless the user has said
++    // otherwise.
++    private pickDefaultViewState = () => {
++        if (this.state.viewStatePinned || this.props.screenSharingSession) {
++            return;
++        }
++
++        const wanted = this.props.otherSessions.length > 1 ? 'grid' : 'speaker';
++        if (wanted === this.state.viewState) {
++            return;
++        }
++
++        // eslint-disable-next-line react/no-did-update-set-state
++        this.setState({viewState: wanted});
++    };
++
++    // The active speaker is whoever most recently started talking, so we look at
++    // the sessions that just went from silent to speaking rather than picking the
++    // first one that happens to be speaking in sort order.
++    private trackActiveSpeaker = (prevProps: Props) => {
++        const wasSpeaking: {[sessionID: string]: boolean} = {};
++        for (const session of prevProps.otherSessions) {
++            wasSpeaking[session.session_id] = Boolean(session.voice);
++        }
++
++        let startedSpeaking = '';
++        for (const session of this.props.otherSessions) {
++            if (session.voice && !wasSpeaking[session.session_id]) {
++                startedSpeaking = session.session_id;
++            }
++        }
++
++        if (!startedSpeaking || startedSpeaking === this.state.activeSessionID) {
++            return;
++        }
++
++        // eslint-disable-next-line react/no-did-update-set-state
++        this.setState({activeSessionID: startedSpeaking});
++    };
++
++    // Streams are dropped from component state only once a session we have
++    // actually seen in the call goes away. We never touch the client map here: it
++    // is shared with the widget and a stream can legitimately arrive before its
++    // session lands in the store.
++    private pruneRemoteVideoStreams = (prevProps: Props) => {
++        const staleSessionIDs = Object.keys(this.state.remoteVideoStreams).filter((sessionID) => {
++            return prevProps.sessionsMap?.[sessionID] && !this.props.sessionsMap?.[sessionID];
++        });
++
++        if (staleSessionIDs.length === 0) {
++            return;
++        }
++
++        // eslint-disable-next-line react/no-did-update-set-state
++        this.setState((state) => {
++            const remoteVideoStreams = {...state.remoteVideoStreams};
++            for (const sessionID of staleSessionIDs) {
++                delete remoteVideoStreams[sessionID];
++            }
++            return {remoteVideoStreams};
++        });
++    };
++
+     requestCallState = () => {
+         const callsClient = getCallsClient();
+         if (!callsClient) {
+@@ -704,11 +802,8 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+                 selfVideoStream: stream,
+             });
+         });
+-        callsClient.on('remoteVideoStream', (stream: MediaStream) => {
+-            this.setState({
+-                otherVideoStream: stream,
+-            });
+-        });
++        callsClient.on('remoteVideoStream', this.onRemoteVideoStream);
++        callsClient.on('remoteVideoStreamRemoved', this.onRemoteVideoStreamRemoved);
+         callsClient.on('devicechange', (audioDevices: MediaDevices, videoDevices: MediaDeviceInfo[]) => {
+             this.setAudioDevices(audioDevices);
+             this.setVideoDevices(videoDevices);
+@@ -741,7 +836,7 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+ 
+         const screenStream = callsClient.getLocalScreenStream() || callsClient.getRemoteScreenStream();
+         const selfVideoStream = callsClient.localVideoStream;
+-        const otherVideoStream = callsClient.getRemoteVideoStream();
++        const remoteVideoStreams = Object.fromEntries(callsClient.getRemoteVideoStreams());
+ 
+         // eslint-disable-next-line react/no-did-mount-set-state
+         this.setState({
+@@ -760,7 +855,8 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+             },
+             screenStream,
+             selfVideoStream,
+-            otherVideoStream,
++            remoteVideoStreams,
++            viewState: this.props.otherSessions.length > 1 ? 'grid' : 'speaker',
+         });
+ 
+         if (window.opener) {
+@@ -826,6 +922,12 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+         window.removeEventListener('blur', this.handleBlur, true);
+         this.#unlockNavigation?.();
+         this.context?.removeFirstConnectListener(this.requestCallState);
++
++        // The client outlives this view, so anything we subscribed to on mount has
++        // to go or it piles up on every expand/collapse cycle.
++        const callsClient = getCallsClient();
++        callsClient?.off('remoteVideoStream', this.onRemoteVideoStream);
++        callsClient?.off('remoteVideoStreamRemoved', this.onRemoteVideoStreamRemoved);
+     }
+ 
+     dismissRecordingPrompt = () => {
+@@ -913,116 +1015,115 @@ export default class ExpandedView extends React.PureComponent<Props, State> {
+         return null;
+     };
+ 
++    getActiveSessionID = () => {
++        const {currentSession, otherSessions} = this.props;
++
++        if (otherSessions.length === 0) {
++            return currentSession?.session_id ?? '';
++        }
++
++        if (otherSessions.some((session) => session.session_id === this.state.activeSessionID)) {
++            return this.state.activeSessionID;
++        }
++
++        return otherSessions[0].session_id;
++    };
++
++    getCallSessions = () => {
++        return this.props.currentSession ? [...this.props.otherSessions, this.props.currentSession] : this.props.otherSessions;
++    };
++
++    renderSessionVideoProfile = (session: UserSessionState, opts?: {width?: string, aspectRatio?: string, profileName?: string}) => {
++        const {formatMessage} = this.props.intl;
++
++        const profile = this.props.profiles[session.user_id];
++        if (!profile) {
++            return null;
++        }
++
++        const isSelf = session.session_id === this.props.currentSession?.session_id;
++        const stream = isSelf ? this.state.selfVideoStream : this.state.remoteVideoStreams[session.session_id] ?? null;
++
++        let profileName = opts?.profileName;
++        if (!profileName) {
++            profileName = isSelf ? `${getUserDisplayName(profile)} ${formatMessage({defaultMessage: '(you)'})}` : getUserDisplayName(profile);
++        }
++
++        return (
++            <VideoProfile
++                key={session.session_id}
++                stream={stream}
++                profile={profile}
++                profileName={profileName}
++                isMuted={!session.unmuted}
++                hasVideo={Boolean(session.video)}
++                isSpeaking={Boolean(session.voice)}
++                mirrorVideo={isSelf && localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true'}
++                width={opts?.width}
++                aspectRatio={opts?.aspectRatio}
++            />
++        );
++    };
++
+     renderTopVideoContainer = () => {
+         const {formatMessage} = this.props.intl;
+ 
+-        // Here we are assuming this only renders in a DM which is the case
+-        // right now.
+-        const selfProfile = this.props.profiles[this.props.currentUserID];
+-        const selfSession = this.props.currentSession;
+-        const otherProfile = this.props.connectedDMUser;
+-        const otherSession = this.props.otherSessions[0];
++        const currentSessionID = this.props.currentSession?.session_id;
++        const activeSessionID = this.getActiveSessionID();
++
++        // While screen sharing the main area is taken by the shared screen, so
++        // everyone gets a thumbnail. In speaker view the active speaker is
++        // rendered large and is left out of the strip.
++        const sessions = (this.props.currentSession ? [this.props.currentSession, ...this.props.otherSessions] : this.props.otherSessions)
++            .filter((session) => this.props.screenSharingSession || session.session_id !== activeSessionID);
+ 
+         return (
+             <VideoProfilesTopContainer
+                 className='calls-popout-top-video-container'
+             >
+-                { selfProfile && selfSession &&
+-                    <div style={{width: '156px', height: '88px'}}>
+-                        <VideoProfile
+-                            stream={this.state.selfVideoStream}
+-                            profile={selfProfile}
+-                            profileName={formatMessage({defaultMessage: '(you)'})}
+-                            isMuted={!selfSession.unmuted}
+-                            hasVideo={Boolean(selfSession.video)}
+-                            isSpeaking={Boolean(selfSession.voice)}
+-                            mirrorVideo={localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true'}
+-                        />
+-                    </div>
+-                }
++                {sessions.map((session) => {
++                    const videoProfile = this.renderSessionVideoProfile(session, {
++                        profileName: session.session_id === currentSessionID ? formatMessage({defaultMessage: '(you)'}) : '',
++                    });
+ 
+-                {this.props.screenSharingSession && otherProfile && otherSession &&
+-                    <div style={{width: '156px', height: '88px'}}>
+-                        <VideoProfile
+-                            stream={this.state.otherVideoStream}
+-                            profile={otherProfile}
+-                            profileName={getUserDisplayName(otherProfile)}
+-                            isMuted={!otherSession.unmuted}
+-                            hasVideo={Boolean(otherSession.video)}
+-                            isSpeaking={Boolean(otherSession.voice)}
+-                            mirrorVideo={false}
+-                        />
+-                    </div>
+-                }
++                    if (!videoProfile) {
++                        return null;
++                    }
++
++                    return (
++                        <VideoProfileThumbnail key={session.session_id}>
++                            {videoProfile}
++                        </VideoProfileThumbnail>
++                    );
++                })}
+             </VideoProfilesTopContainer>
+         );
+     };
+ 
+     renderVideoContainer = () => {
+-        const {formatMessage} = this.props.intl;
+-
+-        // Here we are assuming this only renders in a DM which is the case
+-        // right now.
+-        const selfProfile = this.props.profiles[this.props.currentUserID];
+-        const selfSession = this.props.currentSession;
+-        const otherProfile = this.props.connectedDMUser;
+-        const otherSession = this.props.otherSessions[0];
+-
+-        // If current user is the only one in the call, we show their video, otherwise we show the other user's video.
+-        const session = this.props.otherSessions.length === 0 ? selfSession : otherSession;
+-        const profile = this.props.otherSessions.length === 0 ? selfProfile : otherProfile;
+-        const stream = this.props.otherSessions.length === 0 ? this.state.selfVideoStream : this.state.otherVideoStream;
+-        const mirrorSelfVideo = localStorage.getItem(STORAGE_CALLS_MIRROR_VIDEO_KEY) === 'true';
++        const sessions = this.getCallSessions();
++        const activeSessionID = this.getActiveSessionID();
+ 
+         const shouldRenderTopVideoContainer = this.state.viewState === 'speaker' && ((this.props.currentSession?.video && this.props.otherSessions.length > 0) || this.props.otherSessions.some((s) => s.video));
+ 
+         const renderSpeakerView = () => {
+-            if (!profile || !session) {
++            const session = sessions.find((s) => s.session_id === activeSessionID);
++            if (!session) {
+                 return null;
+             }
+-            return (
+-                <VideoProfile
+-                    stream={stream}
+-                    profile={profile}
+-                    profileName={session === selfSession ? `${getUserDisplayName(profile)} ${formatMessage({defaultMessage: '(you)'})}` : getUserDisplayName(profile)}
+-                    isMuted={!session.unmuted}
+-                    hasVideo={Boolean(session.video)}
+-                    isSpeaking={Boolean(session.voice)}
+-                    mirrorVideo={session === selfSession && mirrorSelfVideo}
+-                    aspectRatio={session === otherSession && !session.video ? '16/9' : ''}
+-                />
+-            );
++
++            const isSelf = session.session_id === this.props.currentSession?.session_id;
++
++            return this.renderSessionVideoProfile(session, {
++                aspectRatio: !isSelf && !session.video ? '16/9' : '',
++            });
+         };
+ 
+         const renderGridView = () => {
+             return (
+-                <>
+-                    { otherProfile && otherSession &&
+-                    <VideoProfile
+-                        stream={this.state.otherVideoStream}
+-                        profile={otherProfile}
+-                        profileName={getUserDisplayName(profile)}
+-                        isMuted={!otherSession.unmuted}
+-                        hasVideo={Boolean(otherSession.video)}
+-                        isSpeaking={Boolean(otherSession.voice)}
+-                        mirrorVideo={false}
+-                        width={'100%'}
+-                    />
+-                    }
+-
+-                    { selfProfile && selfSession &&
+-                    <VideoProfile
+-                        stream={this.state.selfVideoStream}
+-                        profile={selfProfile}
+-                        profileName={`${getUserDisplayName(selfProfile)} ${formatMessage({defaultMessage: '(you)'})}`}
+-                        isMuted={!selfSession.unmuted}
+-                        hasVideo={Boolean(selfSession.video)}
+-                        isSpeaking={Boolean(selfSession.voice)}
+-                        mirrorVideo={mirrorSelfVideo}
+-                        width={'100%'}
+-                    />
+-                    }
+-                </>
++                <VideoProfilesGrid $columns={Math.ceil(Math.sqrt(sessions.length))}>
++                    {sessions.map((session) => this.renderSessionVideoProfile(session, {width: '100%'}))}
++                </VideoProfilesGrid>
+             );
+         };
+ 
+@@ -1872,6 +1973,41 @@ const VideoProfilesTopContainer = styled.div`
+     justify-content: center;
+     gap: 8px;
+     padding: 0px 20px 8px 20px;
++    max-width: 100vw;
++    overflow-x: auto;
++`;
++
++// The tile inside is a 16/9 box driven off the height, so we set the height only
++// and let it decide how wide it needs to be.
++const VideoProfileThumbnail = styled.div`
++    display: flex;
++    flex: 0 0 auto;
++    height: 88px;
++`;
++
++// Tiles hold an 80px avatar that cannot shrink, so rows get a minimum height and
++// the grid scrolls rather than spilling over the controls below it. 'safe center'
++// keeps the first row reachable once the content overflows.
++// Tiles are 16/9 boxes sized off the column width, so rows are sized by their
++// content and the items are centred rather than stretched. 'safe center' keeps
++// the first row reachable once the grid has to scroll.
++const VideoProfilesGrid = styled.div<{$columns: number}>`
++    display: grid;
++    grid-template-columns: repeat(${({$columns}) => $columns}, minmax(160px, 1fr));
++    grid-auto-rows: min-content;
++    align-content: safe center;
++    justify-content: center;
++    align-items: center;
++    justify-items: center;
++    gap: 12px;
++    width: 100%;
++    height: 100%;
++    max-height: 100%;
++    overflow: auto;
++
++    @media (max-width: 700px) {
++      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
++    }
+ `;
+ 
+ const VideoProfilesContainer = styled.div<{$height: string}>`
+@@ -1889,24 +2025,30 @@ const VideoProfilesContainer = styled.div<{$height: string}>`
+     `}
+ `;
+ 
++// Tiles are always 16/9 boxes. Only one axis is ever set explicitly: the caller
++// gives a width (grid cells, which then derive their height) or nothing at all
++// (speaker view and thumbnails, which fill the height they are given). Setting
++// neither leaves the box sized by the video's intrinsic dimensions, which is
++// what produced the tall, misshapen tiles.
+ const VideoProfileContainer = styled.div<{$width?: string, $aspectRatio?: string}>`
+   display: flex;
+   position: relative;
+   align-items: center;
+   justify-content: center;
++  overflow: hidden;
+   background: black;
+   border-radius: 8px;
+-  height: 100%;
++  min-width: 0;
++  min-height: 0;
+   max-height: 100%;
+   max-width: 100%;
++  aspect-ratio: ${({$aspectRatio}) => $aspectRatio || '16 / 9'};
+ 
+-  ${({$aspectRatio}) => $aspectRatio && css`
+-    aspect-ratio: ${$aspectRatio};
+-  `}
+-
+-  ${({$width}) => $width && css`
++  ${({$width}) => ($width ? css`
+       width: ${$width};
+-  `}
++  ` : css`
++      height: 100%;
++  `)}
+ `;
+ 
+ const VideoProfilePlayer = styled.video<{$mirror: boolean}>`
+@@ -1948,6 +2090,7 @@ type VideoProfileProps = {
+     mirrorVideo: boolean;
+     width?: string;
+     aspectRatio?: string;
++    avatarSize?: number;
+ };
+ 
+ const VideoProfile = (props: VideoProfileProps) => {
+@@ -1955,6 +2098,10 @@ const VideoProfile = (props: VideoProfileProps) => {
+ 
+     const MuteIcon = props.isMuted ? MutedIcon : UnmutedIcon;
+ 
++    // A session can be flagged as sending video before its stream reaches us.
++    // Rendering an empty video element in that window would show a black tile.
++    const showVideo = props.hasVideo && Boolean(props.stream);
++
+     useEffect(() => {
+         if (videoEl && props.stream) {
+             videoEl.srcObject = props.stream;
+@@ -1966,9 +2113,9 @@ const VideoProfile = (props: VideoProfileProps) => {
+             $width={props.width}
+             $aspectRatio={props.aspectRatio}
+         >
+-            {!props.hasVideo &&
++            {!showVideo &&
+             <Avatar
+-                size={80}
++                size={props.avatarSize ?? 80}
+                 border={false}
+                 url={Client4.getProfilePictureUrl(props.profile.id, props.profile.last_picture_update)}
+                 borderGlowWidth={props.isSpeaking ? 3 : 0}
+@@ -1976,7 +2123,7 @@ const VideoProfile = (props: VideoProfileProps) => {
+             />
+             }
+ 
+-            {props.hasVideo &&
++            {showVideo &&
+             <VideoProfilePlayer
+                 ref={(el) => setVideoEl(el)}
+                 autoPlay={true}
+diff --git a/webapp/src/components/expanded_view/index.ts b/webapp/src/components/expanded_view/index.ts
+index fdf3650..c8982d1 100644
+--- a/webapp/src/components/expanded_view/index.ts
++++ b/webapp/src/components/expanded_view/index.ts
+@@ -94,7 +94,7 @@ const mapStateToProps = (state: GlobalState) => {
+         transcriptionsEnabled: transcriptionsEnabled(state),
+         isAdmin: isCurrentUserSystemAdmin(state),
+         hostControlsAllowed: areHostControlsAllowed(state),
+-        enableVideo: callsConfig(state).EnableVideo && isDMChannel(channel),
++        enableVideo: callsConfig(state).EnableVideo,
+         otherSessions: sessionsForOtherUsersInCall(state),
+     };
+ };
+diff --git a/webapp/src/index.tsx b/webapp/src/index.tsx
+index 09dbc44..5771143 100644
+--- a/webapp/src/index.tsx
++++ b/webapp/src/index.tsx
+@@ -167,7 +167,6 @@ import {
+     getUserIDsForSessions,
+     getWSConnectionURL,
+     isCallsPopOut,
+-    isDMChannel,
+     playSound,
+     sendDesktopEvent,
+     setCallsGlobalCSSVars,
+@@ -722,7 +721,7 @@ export default class Plugin {
+                     enableAV1: callsConfig(state).EnableAV1,
+                     dcSignaling: callsConfig(state).EnableDCSignaling,
+                     dcLocking: hasDCSignalingLockSupport(callsVersionInfo(state)),
+-                    enableVideo: callsConfig(state).EnableVideo && isDMChannel(channel),
++                    enableVideo: callsConfig(state).EnableVideo,
+                 });
+                 window.currentCallData = CurrentCallDataDefault;
+ 

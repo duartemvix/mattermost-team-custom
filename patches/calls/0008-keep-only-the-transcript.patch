@@ -1,0 +1,204 @@
+diff --git a/plugin.json b/plugin.json
+index ec4e91f..bf24eb6 100644
+--- a/plugin.json
++++ b/plugin.json
+@@ -236,6 +236,13 @@
+             "default": false,
+             "help_text": "(Optional) When set to true, every call starts recording as soon as it begins, without anyone pressing the button. Participants still see the recording banner. Recording people without telling them is a legal question in many places, so leave this off unless you know where you stand. Requires call recordings to be enabled."
+           },
++          {
++            "key": "KeepTranscriptOnly",
++            "display_name": "Keep only the transcript",
++            "type": "bool",
++            "default": false,
++            "help_text": "(Optional) When set to true, the recording is removed from the call thread once its transcript has been posted, so only the text is kept. The recording is made first, because the transcript is produced alongside it, and is only removed after the transcript exists: if transcription fails, the recording stays. Removing it hides it and makes it undownloadable, but the file itself stays on disk until your data retention policy purges it. Requires call transcriptions to be enabled."
++          },
+           {
+             "key": "JobServiceURL",
+             "display_name": "Job service URL",
+@@ -549,6 +556,13 @@
+         "default": false,
+         "help_text": "(Optional) When set to true, every call starts recording as soon as it begins, without anyone pressing the button. Participants still see the recording banner. Recording people without telling them is a legal question in many places, so leave this off unless you know where you stand. Requires call recordings to be enabled."
+       },
++      {
++        "key": "KeepTranscriptOnly",
++        "display_name": "Keep only the transcript",
++        "type": "bool",
++        "default": false,
++        "help_text": "(Optional) When set to true, the recording is removed from the call thread once its transcript has been posted, so only the text is kept. The recording is made first, because the transcript is produced alongside it, and is only removed after the transcript exists: if transcription fails, the recording stays. Removing it hides it and makes it undownloadable, but the file itself stays on disk until your data retention policy purges it. Requires call transcriptions to be enabled."
++      },
+       {
+         "key": "JobServiceURL",
+         "display_name": "Job service URL",
+diff --git a/server/bot_api.go b/server/bot_api.go
+index 3057e17..15ad6ea 100644
+--- a/server/bot_api.go
++++ b/server/bot_api.go
+@@ -276,10 +276,42 @@ func (p *Plugin) handleBotPostRecordings(w http.ResponseWriter, r *http.Request)
+ 		return
+ 	}
+ 
++	// The transcript can land before the recording does. If it already has,
++	// there is nobody left to remove this recording later.
++	if p.getConfiguration().keepTranscriptOnly() && transcriptPosted(post, info.JobID) {
++		p.removeRecordingPost(recPost.Id, info.JobID)
++	}
++
+ 	res.Code = http.StatusOK
+ 	res.Msg = "success"
+ }
+ 
++// transcriptPosted reports whether the transcript for the given recording has
++// already been posted to the call thread.
++func transcriptPosted(callPost *model.Post, recID string) bool {
++	transcriptions, ok := callPost.GetProp("transcriptions").(map[string]any)
++	if !ok {
++		return false
++	}
++	for _, v := range transcriptions {
++		var tm jobMetadata
++		tm.fromMap(v)
++		if tm.RecID == recID && tm.PostID != "" {
++			return true
++		}
++	}
++	return false
++}
++
++// removeRecordingPost deletes a recording post, and with it the file attached
++// to it, for the keep-only-the-transcript setting. A failure is logged and
++// otherwise ignored: keeping a recording we meant to drop is the safe side.
++func (p *Plugin) removeRecordingPost(postID, recID string) {
++	if appErr := p.API.DeletePost(postID); appErr != nil {
++		p.LogError("failed to remove recording post", "recID", recID, "postID", postID, "err", appErr.Error())
++	}
++}
++
+ func (p *Plugin) handleBotPostTranscriptions(w http.ResponseWriter, r *http.Request) {
+ 	var res httpResponse
+ 	defer p.httpAudit("handleBotPostTranscription", &res, w, r)
+@@ -389,7 +421,10 @@ func (p *Plugin) handleBotPostTranscriptions(w http.ResponseWriter, r *http.Requ
+ 	}
+ 	var rm jobMetadata
+ 	rm.fromMap(recordings[tm.RecID])
+-	if rm.PostID != "" {
++	if rm.PostID != "" && p.getConfiguration().keepTranscriptOnly() {
++		// The transcript exists now, so the recording can go.
++		p.removeRecordingPost(rm.PostID, tm.RecID)
++	} else if rm.PostID != "" {
+ 		recPost, err := p.store.GetPost(rm.PostID)
+ 		if err != nil {
+ 			res.Err = "failed to get recording post: " + err.Error()
+diff --git a/server/configuration.go b/server/configuration.go
+index 7d76f45..d46bc7b 100644
+--- a/server/configuration.go
++++ b/server/configuration.go
+@@ -123,6 +123,11 @@ type ClientConfig struct {
+ 	// nobody pressing the button. Off unless an admin turns it on, because
+ 	// recording everyone by default is a consent question, not a preference.
+ 	RecordCallsByDefault *bool
++
++	// KeepTranscriptOnly removes the recording from the call thread once its
++	// transcript has been posted, for teams that want searchable text and not
++	// the video. Off unless an admin turns it on.
++	KeepTranscriptOnly *bool
+ 	// When set to true it enables the call transcriptions functionality
+ 	EnableTranscriptions *bool
+ 	// When set to true it enables the live captions functionality
+@@ -228,6 +233,9 @@ func (c *configuration) SetDefaults() {
+ 	if c.RecordCallsByDefault == nil {
+ 		c.RecordCallsByDefault = model.NewPointer(false)
+ 	}
++	if c.KeepTranscriptOnly == nil {
++		c.KeepTranscriptOnly = model.NewPointer(false)
++	}
+ 	if c.EnableTranscriptions == nil {
+ 		c.EnableTranscriptions = model.NewPointer(false)
+ 	}
+@@ -427,6 +435,10 @@ func (c *configuration) Clone() *configuration {
+ 		cfg.RecordCallsByDefault = model.NewPointer(*c.RecordCallsByDefault)
+ 	}
+ 
++	if c.KeepTranscriptOnly != nil {
++		cfg.KeepTranscriptOnly = model.NewPointer(*c.KeepTranscriptOnly)
++	}
++
+ 	if c.EnableTranscriptions != nil {
+ 		cfg.EnableTranscriptions = model.NewPointer(*c.EnableTranscriptions)
+ 	}
+@@ -513,6 +525,13 @@ func (c *configuration) recordCallsByDefault() bool {
+ 	return c.recordingsEnabled() && c.RecordCallsByDefault != nil && *c.RecordCallsByDefault
+ }
+ 
++// keepTranscriptOnly reports whether recordings should be removed once their
++// transcript is posted. It does nothing without transcriptions, so turning
++// transcription off can never leave a call with neither.
++func (c *configuration) keepTranscriptOnly() bool {
++	return c.transcriptionsEnabled() && c.KeepTranscriptOnly != nil && *c.KeepTranscriptOnly
++}
++
+ func (c *configuration) transcriptionsEnabled() bool {
+ 	if c.recordingsEnabled() && c.EnableTranscriptions != nil && *c.EnableTranscriptions {
+ 		return true
+diff --git a/server/keep_transcript_only_test.go b/server/keep_transcript_only_test.go
+new file mode 100644
+index 0000000..f021651
+--- /dev/null
++++ b/server/keep_transcript_only_test.go
+@@ -0,0 +1,56 @@
++// Copyright (c) 2020-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package main
++
++import (
++	"testing"
++
++	"github.com/mattermost/mattermost/server/public/model"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestKeepTranscriptOnly(t *testing.T) {
++	t.Run("off by default", func(t *testing.T) {
++		var cfg configuration
++		cfg.SetDefaults()
++		require.False(t, cfg.keepTranscriptOnly())
++	})
++
++	t.Run("needs transcriptions", func(t *testing.T) {
++		var cfg configuration
++		cfg.SetDefaults()
++		cfg.KeepTranscriptOnly = model.NewPointer(true)
++		require.False(t, cfg.keepTranscriptOnly())
++
++		cfg.EnableRecordings = model.NewPointer(true)
++		require.False(t, cfg.keepTranscriptOnly())
++
++		cfg.EnableTranscriptions = model.NewPointer(true)
++		require.True(t, cfg.keepTranscriptOnly())
++	})
++
++	t.Run("survives a clone", func(t *testing.T) {
++		var cfg configuration
++		cfg.SetDefaults()
++		cfg.KeepTranscriptOnly = model.NewPointer(true)
++		require.True(t, *cfg.Clone().KeepTranscriptOnly)
++	})
++}
++
++func TestTranscriptPosted(t *testing.T) {
++	post := &model.Post{}
++	require.False(t, transcriptPosted(post, "rec1"))
++
++	post.AddProp("transcriptions", map[string]any{
++		"tr1": (&jobMetadata{RecID: "rec1"}).toMap(),
++	})
++	require.False(t, transcriptPosted(post, "rec1"), "transcript job exists but nothing is posted yet")
++
++	post.AddProp("transcriptions", map[string]any{
++		"tr1": (&jobMetadata{RecID: "rec1", PostID: "p1"}).toMap(),
++	})
++	require.True(t, transcriptPosted(post, "rec1"))
++	require.False(t, transcriptPosted(post, "other"))
++}

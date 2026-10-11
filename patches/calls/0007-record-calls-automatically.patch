@@ -1,0 +1,131 @@
+diff --git a/plugin.json b/plugin.json
+index 400d140..756ff6d 100644
+--- a/plugin.json
++++ b/plugin.json
+@@ -229,6 +229,13 @@
+             "default": false,
+             "help_text": "(Optional) When set to true, call recordings are enabled."
+           },
++          {
++            "key": "RecordCallsByDefault",
++            "display_name": "Record calls automatically",
++            "type": "bool",
++            "default": false,
++            "help_text": "(Optional) When set to true, every call starts recording as soon as it begins, without anyone pressing the button. Participants still see the recording banner. Recording people without telling them is a legal question in many places, so leave this off unless you know where you stand. Requires call recordings to be enabled."
++          },
+           {
+             "key": "JobServiceURL",
+             "display_name": "Job service URL",
+@@ -535,6 +542,13 @@
+         "default": false,
+         "help_text": "(Optional) When set to true, call recordings are enabled."
+       },
++      {
++        "key": "RecordCallsByDefault",
++        "display_name": "Record calls automatically",
++        "type": "bool",
++        "default": false,
++        "help_text": "(Optional) When set to true, every call starts recording as soon as it begins, without anyone pressing the button. Participants still see the recording banner. Recording people without telling them is a legal question in many places, so leave this off unless you know where you stand. Requires call recordings to be enabled."
++      },
+       {
+         "key": "JobServiceURL",
+         "display_name": "Job service URL",
+diff --git a/server/configuration.go b/server/configuration.go
+index 8e4babb..ea0b891 100644
+--- a/server/configuration.go
++++ b/server/configuration.go
+@@ -118,6 +118,11 @@ type ClientConfig struct {
+ 	AllowScreenSharing *bool
+ 	// When set to true it enables the call recordings functionality
+ 	EnableRecordings *bool
++
++	// RecordCallsByDefault starts a recording as soon as a call starts, with
++	// nobody pressing the button. Off unless an admin turns it on, because
++	// recording everyone by default is a consent question, not a preference.
++	RecordCallsByDefault *bool
+ 	// When set to true it enables the call transcriptions functionality
+ 	EnableTranscriptions *bool
+ 	// When set to true it enables the live captions functionality
+@@ -220,6 +225,9 @@ func (c *configuration) SetDefaults() {
+ 	if c.EnableRecordings == nil {
+ 		c.EnableRecordings = model.NewPointer(false)
+ 	}
++	if c.RecordCallsByDefault == nil {
++		c.RecordCallsByDefault = model.NewPointer(false)
++	}
+ 	if c.EnableTranscriptions == nil {
+ 		c.EnableTranscriptions = model.NewPointer(false)
+ 	}
+@@ -432,6 +440,10 @@ func (c *configuration) Clone() *configuration {
+ 		cfg.EnableRecordings = model.NewPointer(*c.EnableRecordings)
+ 	}
+ 
++	if c.RecordCallsByDefault != nil {
++		cfg.RecordCallsByDefault = model.NewPointer(*c.RecordCallsByDefault)
++	}
++
+ 	if c.EnableTranscriptions != nil {
+ 		cfg.EnableTranscriptions = model.NewPointer(*c.EnableTranscriptions)
+ 	}
+@@ -513,6 +525,11 @@ func (c *configuration) recordingsEnabled() bool {
+ 	return false
+ }
+ 
++// recordCallsByDefault reports whether a call should start recording itself.
++func (c *configuration) recordCallsByDefault() bool {
++	return c.recordingsEnabled() && c.RecordCallsByDefault != nil && *c.RecordCallsByDefault
++}
++
+ func (c *configuration) transcriptionsEnabled() bool {
+ 	if c.recordingsEnabled() && c.EnableTranscriptions != nil && *c.EnableTranscriptions {
+ 		return true
+diff --git a/server/recording_api.go b/server/recording_api.go
+index afa5a37..6e48454 100644
+--- a/server/recording_api.go
++++ b/server/recording_api.go
+@@ -73,6 +73,27 @@ func (p *Plugin) recJobTimeoutChecker(callID, jobID string) {
+ 	}
+ }
+ 
++// autoStartRecording starts a recording nobody asked for, because an admin
++// asked for all of them. It takes the call lock itself and runs off the call
++// start path, so a slow or unreachable job service delays nothing: the call is
++// already live and announced by the time this runs.
++func (p *Plugin) autoStartRecording(callID, userID string) {
++	state, err := p.lockCallReturnState(callID)
++	if err != nil {
++		p.LogError("failed to lock call for automatic recording", "err", err.Error(), "callID", callID)
++		return
++	}
++	defer p.unlockCall(callID)
++
++	if state == nil {
++		return
++	}
++
++	if _, _, err := p.startRecordingJob(state, callID, userID); err != nil {
++		p.LogError("failed to start automatic recording", "err", err.Error(), "callID", callID)
++	}
++}
++
+ func (p *Plugin) startRecordingJob(state *callState, callID, userID string) (rst *JobStateClient, rcode int, rerr error) {
+ 	if state.Recording != nil && state.Recording.EndAt == 0 {
+ 		return nil, http.StatusForbidden, fmt.Errorf("recording already in progress")
+diff --git a/server/websocket.go b/server/websocket.go
+index b99b48c..6211ede 100644
+--- a/server/websocket.go
++++ b/server/websocket.go
+@@ -827,6 +827,13 @@ func (p *Plugin) handleJoin(userID, connID, authSessionID string, joinData calls
+ 				"owner_id":  state.Call.OwnerID,
+ 				"host_id":   state.Call.GetHostID(),
+ 			}, &WebSocketBroadcast{ChannelID: channelID, ReliableClusterSend: true})
++
++			// Recording every call is an administrator's decision, and it is
++			// off unless they make it. The banner the client shows when a
++			// recording starts is what tells participants it is happening.
++			if p.getConfiguration().recordCallsByDefault() {
++				go p.autoStartRecording(channelID, userID)
++			}
+ 		}
+ 
+ 		p.LogDebug("session has joined call",

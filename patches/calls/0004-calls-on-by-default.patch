@@ -1,0 +1,38 @@
+diff --git a/plugin.json b/plugin.json
+index 2dcb572..400d140 100644
+--- a/plugin.json
++++ b/plugin.json
+@@ -82,7 +82,7 @@
+             "key": "EnableVideo",
+             "display_name": "Enable video calls in DMs (Experimental)",
+             "type": "bool",
+-            "default": false,
++            "default": true,
+             "help_text": "When set to true, video calls are enabled in direct message channels."
+           }
+         ]
+@@ -724,7 +724,7 @@
+         "key": "EnableVideo",
+         "display_name": "Enable video calls in DMs (Experimental)",
+         "type": "bool",
+-        "default": false,
++        "default": true,
+         "help_text": "When set to true, video calls are enabled in direct message channels."
+       }
+     ]
+diff --git a/server/configuration.go b/server/configuration.go
+index 3b2c712..c6f07fc 100644
+--- a/server/configuration.go
++++ b/server/configuration.go
+@@ -200,8 +200,10 @@ func (c *configuration) SetDefaults() {
+ 
+ 	c.AllowEnableCalls = model.NewPointer(true)
+ 
++	// Mattermore ships calls usable out of the box, so they are on in every
++	// channel unless an admin turns them off.
+ 	if c.DefaultEnabled == nil {
+-		c.DefaultEnabled = model.NewPointer(false)
++		c.DefaultEnabled = model.NewPointer(true)
+ 	}
+ 	if c.MaxCallParticipants == nil {
+ 		c.MaxCallParticipants = model.NewPointer(0) // unlimited
