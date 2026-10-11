@@ -1,0 +1,68 @@
+--- a/webapp/channels/src/components/login/login.tsx
++++ b/webapp/channels/src/components/login/login.tsx
+@@ -182,4 +182,15 @@
+         }
+ 
++        if (enableSignUpWithOpenId) {
++            const url = `${Client4.getOAuthRoute()}/openid/login${search}`;
++            externalLoginOptions.push({
++                id: 'openid',
++                url,
++                icon: <LoginGoogleIcon/>,
++                label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
++                onClick: handleExternalAuth(url, 'openid'),
++            });
++        }
++
+         if (enableSignUpWithOffice365) {
+             const url = `${Client4.getOAuthRoute()}/office365/login${search}`;
+@@ -190,15 +201,4 @@
+                 label: formatMessage({id: 'login.office365', defaultMessage: 'Continue with Microsoft'}),
+                 onClick: handleExternalAuth(url, 'office365'),
+-            });
+-        }
+-
+-        if (enableSignUpWithOpenId) {
+-            const url = `${Client4.getOAuthRoute()}/openid/login${search}`;
+-            externalLoginOptions.push({
+-                id: 'openid',
+-                url,
+-                icon: <LoginGoogleIcon/>,
+-                label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+-                onClick: handleExternalAuth(url, 'openid'),
+             });
+         }
+--- a/webapp/channels/src/components/signup/signup.tsx
++++ b/webapp/channels/src/components/signup/signup.tsx
+@@ -179,4 +179,15 @@
+         }
+ 
++        if (isLicensed && enableSignUpWithOpenId) {
++            const url = `${Client4.getOAuthRoute()}/openid/signup${search}`;
++            externalLoginOptions.push({
++                id: 'openid',
++                url,
++                icon: <LoginGoogleIcon/>,
++                label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
++                onClick: desktopExternalAuth(url),
++            });
++        }
++
+         if (isLicensed && enableSignUpWithOffice365) {
+             const url = `${Client4.getOAuthRoute()}/office365/signup${search}`;
+@@ -186,15 +197,4 @@
+                 icon: <EntraIdIcon/>,
+                 label: formatMessage({id: 'login.office365', defaultMessage: 'Continue with Microsoft'}),
+-                onClick: desktopExternalAuth(url),
+-            });
+-        }
+-
+-        if (isLicensed && enableSignUpWithOpenId) {
+-            const url = `${Client4.getOAuthRoute()}/openid/signup${search}`;
+-            externalLoginOptions.push({
+-                id: 'openid',
+-                url,
+-                icon: <LoginGoogleIcon/>,
+-                label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+                 onClick: desktopExternalAuth(url),
+             });
