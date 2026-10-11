@@ -23,6 +23,7 @@ Enterprise code, no licence checks touched.
 | `0014-openid-button-google-icon` | Login/signup SSO button renders Google’s “G” instead of the generic OpenID mark | Deployment authenticates against Google; matches the plan’s required button |
 | `0015-office365-button-without-license` / `0016-matching-sso-button-style` / `0017-google-button-first` | Adds and styles the Microsoft button and orders Google first | Dual-provider SSO on Team Edition |
 | `0018-oauth-invitation-only-signup` | Enforces Open Server for OAuth signup: email-bound one-time invitations, verified email matching, and correct Guest provisioning | Stop uninvited OAuth identities bypassing `EnableOpenServer=false` |
+| `0019-show-guest-invites-on-team-edition` | Removes the `BuildEnterpriseReady` UI gate from guest invitation controls | Expose the already-enabled guest invite flow in Team Edition |
 | `calls/0001-0009` | Calls plugin: group calls + video, recording, transcription, on-by-default | Partner voice/video; see Calls below |
 
 Deliberately **not** ported: fork branding + branded assets (we ship upstream
@@ -88,6 +89,13 @@ claim rely on the invitation email as proof of mailbox access. Guest invitations
 create Guest accounts and apply their invited channel scope. Existing OAuth users can still sign in. Keep
 `EnableUserCreation` enabled to allow invited new users; setting it false is an
 emergency blanket block that also prevents invited first-time sign-ins.
+
+To invite a Guest, use the team’s **Invite People** dialog, choose **Guest** in
+the **Invite as** selector, and select the channels they may access. With
+`EnableGuestMagicLink=true`, the optional “Allow invited guests to log in with
+a magic link” checkbox sends a passwordless, one-time link to the invited email.
+The Guest account is created when that invitation is redeemed; selecting
+Member instead creates a regular team member.
 
 ## Trademark & licence
 

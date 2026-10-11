@@ -1,0 +1,62 @@
+diff --git a/webapp/channels/src/components/channel_invite_modal/index.ts b/webapp/channels/src/components/channel_invite_modal/index.ts
+index 0ad8f27d..12771abd 100644
+--- a/webapp/channels/src/components/channel_invite_modal/index.ts
++++ b/webapp/channels/src/components/channel_invite_modal/index.ts
+@@ -87,10 +87,7 @@ function makeMapStateToProps(initialState: GlobalState, initialProps: OwnProps)
+         const guestAccountsEnabled = config.EnableGuestAccounts === 'true';
+         const emailInvitationsEnabled = config.EnableEmailInvitations === 'true';
+-        // Guest accounts are not licence-gated, so match invitation_modal and key off the
+-        // build flag instead of IsLicensed.
+-        const isEnterpriseReady = config.BuildEnterpriseReady === 'true';
+         const isGroupConstrained = Boolean(currentTeam?.group_constrained);
+-        const canInviteGuests = !isGroupConstrained && isEnterpriseReady && guestAccountsEnabled && haveICurrentTeamPermission(state, Permissions.INVITE_GUEST);
++        const canInviteGuests = !isGroupConstrained && guestAccountsEnabled && haveICurrentTeamPermission(state, Permissions.INVITE_GUEST);
+         const enableCustomUserGroups = isCustomGroupsEnabled(state);
+ 
+         const isGroupsEnabled = enableCustomUserGroups || (license?.IsLicensed === 'true' && license?.LDAPGroups === 'true');
+diff --git a/webapp/channels/src/components/invitation_modal/index.test.tsx b/webapp/channels/src/components/invitation_modal/index.test.tsx
+index ebf46dbd..9346caae 100644
+--- a/webapp/channels/src/components/invitation_modal/index.test.tsx
++++ b/webapp/channels/src/components/invitation_modal/index.test.tsx
+@@ -96,7 +96,7 @@ describe('mapStateToProps', () => {
+         expect(props.canInviteGuests).toBe(false);
+     });
+ 
+-    test('canInviteGuests is false when BuildEnterpriseReady is false', () => {
++    test('canInviteGuests does not require BuildEnterpriseReady', () => {
+         const testState = {
+             ...initialState,
+             entities: {
+@@ -115,7 +115,7 @@ describe('mapStateToProps', () => {
+                     teams: {
+                         [currentTeamId]: {
+                             id: currentTeamId,
+-                            group_constrained: true,
++                            group_constrained: false,
+                         },
+                     },
+                 },
+@@ -123,7 +123,7 @@ describe('mapStateToProps', () => {
+         } as unknown as GlobalState;
+ 
+         const props = mapStateToProps(testState, {});
+-        expect(props.canInviteGuests).toBe(false);
++        expect(props.canInviteGuests).toBe(true);
+     });
+ 
+     test('canInviteGuests is true when group_constrained is false', () => {
+diff --git a/webapp/channels/src/components/invitation_modal/index.tsx b/webapp/channels/src/components/invitation_modal/index.tsx
+index 2a2c64c0..798366e8 100644
+--- a/webapp/channels/src/components/invitation_modal/index.tsx
++++ b/webapp/channels/src/components/invitation_modal/index.tsx
+@@ -71,9 +71,8 @@ export function mapStateToProps(state: GlobalState, props: OwnProps) {
+     const guestAccountsEnabled = config.EnableGuestAccounts === 'true';
+     const emailInvitationsEnabled = config.EnableEmailInvitations === 'true';
+     const lockProfileFieldsForEmailUsers = normalizeLockProfileFieldsSetting(config.LockProfileFieldsForEmailUsers);
+-    const isEnterpriseReady = config.BuildEnterpriseReady === 'true';
+     const isGroupConstrained = Boolean(currentTeam?.group_constrained);
+-    const calculatedCanInviteGuests = !isGroupConstrained && isEnterpriseReady && guestAccountsEnabled && haveICurrentTeamPermission(state, Permissions.INVITE_GUEST);
++    const calculatedCanInviteGuests = !isGroupConstrained && guestAccountsEnabled && haveICurrentTeamPermission(state, Permissions.INVITE_GUEST);
+     const canInviteGuests = props.canInviteGuests === undefined ? calculatedCanInviteGuests : (calculatedCanInviteGuests && props.canInviteGuests);
+ 
+     const isCloud = license.Cloud === 'true';
