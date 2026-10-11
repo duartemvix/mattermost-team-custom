@@ -1,0 +1,43 @@
+diff --git a/webapp/channels/src/components/login/login.tsx b/webapp/channels/src/components/login/login.tsx
+index a826eb39..4fdb0f8b 100644
+--- a/webapp/channels/src/components/login/login.tsx
++++ b/webapp/channels/src/components/login/login.tsx
+@@ -42,7 +42,6 @@ import EntraIdIcon from 'components/widgets/icons/entra_id_icon';
+ import LockIcon from 'components/widgets/icons/lock_icon';
+ import LoginGitlabIcon from 'components/widgets/icons/login_gitlab_icon';
+ import LoginGoogleIcon from 'components/widgets/icons/login_google_icon';
+-import LoginOpenIDIcon from 'components/widgets/icons/login_openid_icon';
+ import Input, {SIZE} from 'components/widgets/inputs/input/input';
+ import PasswordInput from 'components/widgets/inputs/password_input/password_input';
+ 
+@@ -198,7 +197,7 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+             externalLoginOptions.push({
+                 id: 'openid',
+                 url,
+-                icon: <LoginOpenIDIcon/>,
++                icon: <LoginGoogleIcon/>,
+                 label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+                 style: {color: OpenIdButtonColor, borderColor: OpenIdButtonColor},
+                 onClick: handleExternalAuth(url, 'openid'),
+diff --git a/webapp/channels/src/components/signup/signup.tsx b/webapp/channels/src/components/signup/signup.tsx
+--- a/webapp/channels/src/components/signup/signup.tsx
++++ b/webapp/channels/src/components/signup/signup.tsx
+@@ -42,7 +42,6 @@ import EntraIdIcon from 'components/widgets/icons/entra_id_icon';
+ import LockIcon from 'components/widgets/icons/lock_icon';
+ import LoginGitlabIcon from 'components/widgets/icons/login_gitlab_icon';
+ import LoginGoogleIcon from 'components/widgets/icons/login_google_icon';
+-import LoginOpenIDIcon from 'components/widgets/icons/login_openid_icon';
+ import CheckInput from 'components/widgets/inputs/check';
+ import Input, {SIZE} from 'components/widgets/inputs/input/input';
+ import type {CustomMessageInputType} from 'components/widgets/inputs/input/input';
+@@ -193,9 +193,9 @@ const Signup = ({onCustomizeHeader}: SignupProps) => {
+         if (isLicensed && enableSignUpWithOpenId) {
+             const url = `${Client4.getOAuthRoute()}/openid/signup${search}`;
+             externalLoginOptions.push({
+                 id: 'openid',
+                 url,
+-                icon: <LoginOpenIDIcon/>,
++                icon: <LoginGoogleIcon/>,
+                 label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+                 style: {color: OpenIdButtonColor, borderColor: OpenIdButtonColor},
+                 onClick: desktopExternalAuth(url),

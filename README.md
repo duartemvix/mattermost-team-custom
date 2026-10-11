@@ -20,7 +20,7 @@ Enterprise code, no licence checks touched.
 | `0006-remove-licence-badges` | Removes the “Free Version” label + unsupported-version notice | Cosmetic; display strings only |
 | `0007-prepackaged-signature-optional` | Allows installing our unsigned calls bundle | Required to ship our own plugin build |
 | `0013-ignore-superseded-plugins` | Server ignores the stale official calls bundle in the base image | Our bundle replaces it without a removal fight |
-| `0014-openid-button-adaptive-icon` | Login/signup SSO button shows Google’s “G”, Entra’s mark, or the generic OpenID mark depending on the configured discovery endpoint | One provider serves one IdP at a time; the icon follows it |
+| `0014-openid-button-google-icon` | Login/signup SSO button renders Google’s “G” instead of the generic OpenID mark | Deployment authenticates against Google; matches the plan’s required button |
 | `calls/0001-0009` | Calls plugin: group calls + video, recording, transcription, on-by-default | Partner voice/video; see Calls below |
 
 Deliberately **not** ported: fork branding + branded assets (we ship upstream
