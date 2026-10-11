@@ -1,0 +1,14 @@
+diff --git a/server/config/client.go b/server/config/client.go
+index 4aca5d55..9d1c2f8a 100644
+--- a/server/config/client.go
++++ b/server/config/client.go
+@@ -375,5 +375,9 @@
+ 	props["EnableSignUpWithOpenId"] = strconv.FormatBool(*c.OpenIdSettings.Enable)
+ 	props["OpenIdButtonColor"] = *c.OpenIdSettings.ButtonColor
+ 	props["OpenIdButtonText"] = *c.OpenIdSettings.ButtonText
++	// Team Edition ships no enterprise Office365 module; the generic OpenID
++	// Connect provider serves the office365 service when its scope contains
++	// "openid" (see getSSOProvider in server/channels/app/oauth.go).
++	props["EnableSignUpWithOffice365"] = strconv.FormatBool(*c.Office365Settings.Enable)
+ 	props["EnableCustomBrand"] = strconv.FormatBool(*c.TeamSettings.EnableCustomBrand)
+ 	props["CustomBrandText"] = *c.TeamSettings.CustomBrandText
