@@ -1,0 +1,59 @@
+# Builds what a release would build, on every pull request.
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patches:
+    name: patches apply
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: upstream
+        run: grep -E '^[A-Z_]+=' upstream.env >> "$GITHUB_OUTPUT"
+
+      - name: Server patches apply to the pinned tag
+        run: |
+          git clone --quiet --depth 1 --branch "${{ steps.upstream.outputs.SERVER_TAG }}" \
+            --filter=blob:none https://github.com/mattermost/mattermost.git /tmp/server
+          for p in patches/server/*.patch; do
+            git -C /tmp/server apply "$PWD/$p" || { echo "::error::$p does not apply"; exit 1; }
+            echo "applied $(basename "$p")"
+          done
+
+  server:
+    name: server compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - name: Build the server binary
+        # The web app is four minutes and is not what breaks: a release builds
+        # it, this proves the Go side and the patch series compile.
+        env:
+          SKIP_WEBAPP: '1'
+        run: ./scripts/build-server.sh /tmp/custom-server
+
+  e2e:
+    name: image runs end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - name: Build the image
+        env:
+          CONTAINER_ENGINE: docker
+        run: ./scripts/build-image.sh custom-mm:ci
+      - name: Run it and check the promises
+        run: ./scripts/e2e.sh custom-mm:ci

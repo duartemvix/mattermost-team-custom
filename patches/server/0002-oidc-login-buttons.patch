@@ -1,0 +1,37 @@
+diff --git a/server/config/client.go b/server/config/client.go
+index f06d9e91..4aca5d55 100644
+--- a/server/config/client.go
++++ b/server/config/client.go
+@@ -368,10 +368,13 @@ func GenerateLimitedClientConfig(c *model.Config, telemetryID string, license *m
+ 	props["SamlLoginButtonText"] = ""
+ 	props["EnableSignUpWithGoogle"] = "false"
+ 	props["EnableSignUpWithOffice365"] = "false"
+-	props["EnableSignUpWithOpenId"] = "false"
+-	props["OpenIdButtonText"] = ""
+-	props["OpenIdButtonColor"] = ""
+ 	props["CWSURL"] = ""
++	props["EnableSignUpWithGitLab"] = strconv.FormatBool(*c.GitLabSettings.Enable)
++	props["GitLabButtonColor"] = *c.GitLabSettings.ButtonColor
++	props["GitLabButtonText"] = *c.GitLabSettings.ButtonText
++	props["EnableSignUpWithOpenId"] = strconv.FormatBool(*c.OpenIdSettings.Enable)
++	props["OpenIdButtonColor"] = *c.OpenIdSettings.ButtonColor
++	props["OpenIdButtonText"] = *c.OpenIdSettings.ButtonText
+ 	props["EnableCustomBrand"] = strconv.FormatBool(*c.TeamSettings.EnableCustomBrand)
+ 	props["CustomBrandText"] = *c.TeamSettings.CustomBrandText
+ 	props["CustomDescriptionText"] = *c.TeamSettings.CustomDescriptionText
+@@ -416,15 +419,6 @@ func GenerateLimitedClientConfig(c *model.Config, telemetryID string, license *m
+ 			props["EnableSignUpWithOffice365"] = strconv.FormatBool(*c.Office365Settings.Enable)
+ 		}
+ 
+-		if *license.Features.OpenId {
+-			props["EnableSignUpWithOpenId"] = strconv.FormatBool(*c.OpenIdSettings.Enable)
+-			props["OpenIdButtonColor"] = *c.OpenIdSettings.ButtonColor
+-			props["OpenIdButtonText"] = *c.OpenIdSettings.ButtonText
+-			props["EnableSignUpWithGitLab"] = strconv.FormatBool(*c.GitLabSettings.Enable)
+-			props["GitLabButtonColor"] = *c.GitLabSettings.ButtonColor
+-			props["GitLabButtonText"] = *c.GitLabSettings.ButtonText
+-		}
+-
+ 		if model.MinimumEnterpriseLicense(license) {
+ 			props["MobileEnableBiometrics"] = strconv.FormatBool(*c.NativeAppSettings.MobileEnableBiometrics)
+ 			props["MobilePreventScreenCapture"] = strconv.FormatBool(*c.NativeAppSettings.MobilePreventScreenCapture)

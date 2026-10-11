@@ -1,0 +1,12 @@
+{
+  "PluginSettings": {
+    "PluginStates": {
+      "mattermost-ai": {
+        "Enable": false
+      },
+      "playbooks": {
+        "Enable": false
+      }
+    }
+  }
+}

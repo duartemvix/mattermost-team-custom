@@ -1,0 +1,298 @@
+From 7e0f2a442f39348507eba8ad3ae6fce8a458263d Mon Sep 17 00:00:00 2001
+From: Dennis Klappe <dennisklappe@gmail.com>
+Date: Tue, 8 Sep 2026 14:19:40 +0200
+Subject: [PATCH] Lift the licence gate on guest accounts
+
+The guest account implementation ships in full in the AGPL server, only the
+gates are licence-checked. Removes every one of them:
+
+  server/channels/utils/license.go   GuestAccounts client props
+  server/channels/api4/user.go       createUser guest-invitation token,
+                                     login, getLoginType, magic-link mail,
+                                     demoteUserToGuest
+  server/channels/api4/team.go       inviteGuestsToChannels
+  server/channels/api4/role.go       patching guest role permissions
+
+Without the createUser and login hunks a guest could be invited but never
+redeem the invite or sign in, which made the rest of the lift useless.
+
+Guest accounts now follow GuestAccountsSettings.Enable alone.
+
+See https://mattermore.dev/guest-accounts
+---
+ server/channels/api4/role.go      | 14 ++------------
+ server/channels/api4/role_test.go | 10 +++++-----
+ server/channels/api4/team.go      | 13 +------------
+ server/channels/api4/team_test.go | 11 ++++++-----
+ server/channels/api4/user.go      | 36 ++++++------------------------------
+ server/channels/api4/user_test.go | 13 ++-----------
+ server/channels/utils/license.go  |  7 +++++--
+ 7 files changed, 27 insertions(+), 77 deletions(-)
+
+diff --git a/server/channels/api4/role.go b/server/channels/api4/role.go
+index 1956002f..41f2498c 100644
+--- a/server/channels/api4/role.go
++++ b/server/channels/api4/role.go
+@@ -164,13 +164,8 @@ func patchRole(c *Context, w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	isGuest := oldRole.Name == model.SystemGuestRoleId || oldRole.Name == model.TeamGuestRoleId || oldRole.Name == model.ChannelGuestRoleId
+-	if c.App.Channels().License() == nil && patch.Permissions != nil {
+-		if isGuest {
+-			c.Err = model.NewAppError("Api4.PatchRoles", "api.roles.patch_roles.license.error", nil, "", http.StatusNotImplemented)
+-			return
+-		}
+-	}
++	// Guest role permissions are editable on any server: the implementation is AGPL,
++	// so neither the unlicensed nor the GuestAccountsPermissions gate applies here.
+ 
+ 	// Licensed instances can not change permissions in the blacklist set.
+ 	if patch.Permissions != nil {
+@@ -193,11 +188,6 @@ func patchRole(c *Context, w http.ResponseWriter, r *http.Request) {
+ 		*patch.Permissions = model.RemoveDuplicateStrings(*patch.Permissions)
+ 	}
+ 
+-	if c.App.Channels().License() != nil && isGuest && !*c.App.Channels().License().Features.GuestAccountsPermissions {
+-		c.Err = model.NewAppError("Api4.PatchRoles", "api.roles.patch_roles.license.error", nil, "", http.StatusNotImplemented)
+-		return
+-	}
+-
+ 	if oldRole.Name == model.TeamAdminRoleId ||
+ 		oldRole.Name == model.ChannelAdminRoleId ||
+ 		oldRole.Name == model.SystemUserRoleId ||
+diff --git a/server/channels/api4/role_test.go b/server/channels/api4/role_test.go
+index 1c9df6b0..447442bd 100644
+--- a/server/channels/api4/role_test.go
++++ b/server/channels/api4/role_test.go
+@@ -392,19 +392,19 @@ func TestPatchRole(t *testing.T) {
+ 		assert.ElementsMatch(t, expectedPermissions, received.Permissions)
+ 		assert.Equal(t, received.SchemeManaged, role.SchemeManaged)
+ 
+-		t.Run("Check guest permissions editing without E20 license", func(t *testing.T) {
++		t.Run("Check guest permissions editing without a guest accounts license", func(t *testing.T) {
++			// Guest role permissions are no longer licence-gated.
+ 			license := model.NewTestLicense()
+ 			license.Features.GuestAccountsPermissions = new(false)
+ 			th.App.Srv().SetLicense(license)
+ 
+ 			guestRole, err := th.App.Srv().Store().Role().GetByName(th.Context, "system_guest")
+ 			require.NoError(t, err)
+-			received, resp, err = client.PatchRole(context.Background(), guestRole.Id, patch)
+-			require.Error(t, err)
+-			CheckNotImplementedStatus(t, resp)
++			_, _, err = client.PatchRole(context.Background(), guestRole.Id, patch)
++			require.NoError(t, err)
+ 		})
+ 
+-		t.Run("Check guest permissions editing with E20 license", func(t *testing.T) {
++		t.Run("Check guest permissions editing with a guest accounts license", func(t *testing.T) {
+ 			license := model.NewTestLicense()
+ 			license.Features.GuestAccountsPermissions = new(true)
+ 			th.App.Srv().SetLicense(license)
+diff --git a/server/channels/api4/team.go b/server/channels/api4/team.go
+index 021c3c6d..b34ed99b 100644
+--- a/server/channels/api4/team.go
++++ b/server/channels/api4/team.go
+@@ -1783,11 +1783,7 @@ func inviteUsersToTeam(c *Context, w http.ResponseWriter, r *http.Request) {
+ func inviteGuestsToChannels(c *Context, w http.ResponseWriter, r *http.Request) {
+ 	graceful := r.URL.Query().Get("graceful") != ""
+ 
+-	if c.App.Channels().License() == nil {
+-		c.Err = model.NewAppError("Api4.InviteGuestsToChannels", "api.team.invite_guests_to_channels.license.error", nil, "", http.StatusNotImplemented)
+-		return
+-	}
+-
++	// Guest accounts are unlicensed here: config alone decides.
+ 	if !*c.App.Config().GuestAccountsSettings.Enable {
+ 		c.Err = model.NewAppError("Api4.InviteGuestsToChannels", "api.team.invite_guests_to_channels.disabled.error", nil, "", http.StatusNotImplemented)
+ 		return
+@@ -1816,13 +1812,6 @@ func inviteGuestsToChannels(c *Context, w http.ResponseWriter, r *http.Request)
+ 		return
+ 	}
+ 
+-	guestEnabled := c.App.Channels().License() != nil && *c.App.Channels().License().Features.GuestAccounts
+-
+-	if !guestEnabled {
+-		c.Err = model.NewAppError("Api4.InviteGuestsToChannels", "api.team.invite_guests_to_channels.disabled.error", nil, "", http.StatusForbidden)
+-		return
+-	}
+-
+ 	var guestsInvite model.GuestsInvite
+ 	if err := json.NewDecoder(r.Body).Decode(&guestsInvite); err != nil {
+ 		c.Err = model.NewAppError("Api4.inviteGuestsToChannels", "api.team.invite_guests_to_channels.invalid_body.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+diff --git a/server/channels/api4/team_test.go b/server/channels/api4/team_test.go
+index 10610eaa..0f6ce730 100644
+--- a/server/channels/api4/team_test.go
++++ b/server/channels/api4/team_test.go
+@@ -4659,10 +4659,11 @@ func TestInviteGuestsToTeam(t *testing.T) {
+ 
+ 	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.EnableEmailInvitations = true })
+ 
++	// Guest accounts are not licence-gated, so an unlicensed server invites just fine.
+ 	th.App.Srv().SetLicense(nil)
+ 
+ 	_, err = th.SystemAdminClient.InviteGuestsToTeam(context.Background(), th.BasicTeam.Id, emailList, []string{th.BasicChannel.Id}, "test-message")
+-	require.Error(t, err, "Should be disabled")
++	require.NoError(t, err)
+ 
+ 	th.App.Srv().SetLicense(model.NewTestLicense(""))
+ 	defer th.App.Srv().SetLicense(nil)
+@@ -4773,7 +4774,8 @@ func TestInviteGuest(t *testing.T) {
+ 	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.GuestAccountsSettings.Enable = true })
+ 	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.EnableEmailInvitations = true })
+ 
+-	t.Run("Guest Account not available in license returns forbidden", func(t *testing.T) {
++	t.Run("Guest Account not in license still returns OK", func(t *testing.T) {
++		// Guest accounts are not licence-gated, only GuestAccountsSettings.Enable applies.
+ 		th.App.Srv().SetLicense(model.NewTestLicenseWithFalseDefaults("guest_accounts"))
+ 
+ 		guestsInvite := model.GuestsInvite{
+@@ -4786,9 +4788,8 @@ func TestInviteGuest(t *testing.T) {
+ 
+ 		res, err := th.SystemAdminClient.DoAPIPost(context.Background(), "/teams/"+th.BasicTeam.Id+"/invite-guests/email", string(buf))
+ 
+-		require.Equal(t, http.StatusForbidden, res.StatusCode)
+-		require.True(t, strings.Contains(err.Error(), "Guest accounts are disabled"))
+-		require.Error(t, err)
++		require.Equal(t, http.StatusOK, res.StatusCode)
++		require.NoError(t, err)
+ 	})
+ 
+ 	t.Run("Guest Account available in license returns OK", func(t *testing.T) {
+diff --git a/server/channels/api4/user.go b/server/channels/api4/user.go
+index dc9ef59e..b60266fa 100644
+--- a/server/channels/api4/user.go
++++ b/server/channels/api4/user.go
+@@ -268,10 +268,7 @@ func createUser(c *Context, w http.ResponseWriter, r *http.Request) {
+ 		auditRec.AddMeta("token_type", token.Type)
+ 
+ 		if token.Type == model.TokenTypeGuestInvitation {
+-			if c.App.Channels().License() == nil {
+-				c.Err = model.NewAppError("CreateUserWithToken", "api.user.create_user.guest_accounts.license.app_error", nil, "", http.StatusBadRequest)
+-				return
+-			}
++			// Guest accounts are unlicensed here: config alone decides.
+ 			if !*c.App.Config().GuestAccountsSettings.Enable {
+ 				c.Err = model.NewAppError("CreateUserWithToken", "api.user.create_user.guest_accounts.disabled.app_error", nil, "", http.StatusBadRequest)
+ 				return
+@@ -2243,10 +2240,7 @@ func login(c *Context, w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	if user.IsGuest() {
+-		if c.App.Channels().License() == nil {
+-			c.Err = model.NewAppError("login", "api.user.login.guest_accounts.license.error", nil, "", http.StatusUnauthorized)
+-			return
+-		}
++		// Guest accounts are unlicensed here: config alone decides.
+ 		if !*c.App.Config().GuestAccountsSettings.Enable {
+ 			c.Err = model.NewAppError("login", "api.user.login.guest_accounts.disabled.error", nil, "", http.StatusUnauthorized)
+ 			return
+@@ -2432,9 +2426,9 @@ func getLoginType(c *Context, w http.ResponseWriter, r *http.Request) {
+ 	// For the time being, we only support getting the login type when
+ 	// guest magic link is enabled. We can consider adding support for other
+ 	// login methods in the future, and this check may be removed.
++	// Guest accounts are unlicensed here: config alone decides.
+ 	if !*c.App.Config().GuestAccountsSettings.EnableGuestMagicLink ||
+-		!*c.App.Config().GuestAccountsSettings.Enable ||
+-		!*c.App.Channels().License().Features.GuestAccounts {
++		!*c.App.Config().GuestAccountsSettings.Enable {
+ 		w.WriteHeader(http.StatusNotFound)
+ 		return
+ 	}
+@@ -2486,14 +2480,7 @@ func getLoginType(c *Context, w http.ResponseWriter, r *http.Request) {
+ 			return false
+ 		}
+ 
+-		if c.App.Channels().License() == nil {
+-			return false
+-		}
+-
+-		if !*c.App.Channels().License().Features.GuestAccounts {
+-			return false
+-		}
+-
++		// Guest accounts are unlicensed here: config alone decides.
+ 		if !*c.App.Config().GuestAccountsSettings.EnableGuestMagicLink {
+ 			return false
+ 		}
+@@ -3543,23 +3530,12 @@ func demoteUserToGuest(c *Context, w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	if c.App.Channels().License() == nil {
+-		c.Err = model.NewAppError("Api4.demoteUserToGuest", "api.team.demote_user_to_guest.license.error", nil, "", http.StatusNotImplemented)
+-		return
+-	}
+-
++	// Guest accounts are unlicensed here: config alone decides.
+ 	if !*c.App.Config().GuestAccountsSettings.Enable {
+ 		c.Err = model.NewAppError("Api4.demoteUserToGuest", "api.team.demote_user_to_guest.disabled.error", nil, "", http.StatusNotImplemented)
+ 		return
+ 	}
+ 
+-	guestEnabled := c.App.Channels().License() != nil && *c.App.Channels().License().Features.GuestAccounts
+-
+-	if !guestEnabled {
+-		c.Err = model.NewAppError("Api4.demoteUserToGuest", "api.team.invite_guests_to_channels.disabled.error", nil, "", http.StatusForbidden)
+-		return
+-	}
+-
+ 	auditRec := c.MakeAuditRecord(model.AuditEventDemoteUserToGuest, model.AuditStatusFail)
+ 	model.AddEventParameterToAuditRec(auditRec, "user_id", c.Params.UserId)
+ 	defer c.LogAuditRec(auditRec)
+diff --git a/server/channels/api4/user_test.go b/server/channels/api4/user_test.go
+index 2e9ab1b2..356ca8b5 100644
+--- a/server/channels/api4/user_test.go
++++ b/server/channels/api4/user_test.go
+@@ -7806,21 +7806,12 @@ func TestDemoteUserToGuest(t *testing.T) {
+ 	user := th.BasicUser
+ 	user2 := th.BasicUser2
+ 
+-	t.Run("Guest Account not available in license returns forbidden", func(t *testing.T) {
++	t.Run("Guest Account not in license still returns OK", func(t *testing.T) {
++		// Guest accounts are not licence-gated, only GuestAccountsSettings.Enable applies.
+ 		th.App.Srv().SetLicense(model.NewTestLicenseWithFalseDefaults("guest_accounts"))
+ 
+ 		res, err := th.SystemAdminClient.DoAPIPost(context.Background(), "/users/"+user2.Id+"/demote", "")
+ 
+-		require.Equal(t, http.StatusForbidden, res.StatusCode)
+-		require.True(t, strings.Contains(err.Error(), "Guest accounts are disabled"))
+-		require.Error(t, err)
+-	})
+-
+-	t.Run("Guest Account available in license returns OK", func(t *testing.T) {
+-		th.App.Srv().SetLicense(model.NewTestLicense("guest_accounts"))
+-
+-		res, err := th.SystemAdminClient.DoAPIPost(context.Background(), "/users/"+user2.Id+"/demote", "")
+-
+ 		require.Equal(t, http.StatusOK, res.StatusCode)
+ 		require.NoError(t, err)
+ 	})
+diff --git a/server/channels/utils/license.go b/server/channels/utils/license.go
+index b9b8337c..f8707b08 100644
+--- a/server/channels/utils/license.go
++++ b/server/channels/utils/license.go
+@@ -225,6 +225,11 @@ func GetClientLicense(l *model.License) map[string]string {
+ 
+ 	props["IsLicensed"] = strconv.FormatBool(l != nil)
+ 
++	// Guest accounts ship in full in the AGPL server, so advertise them to the client
++	// regardless of the license. Without these the admin console hides Guest Access.
++	props["GuestAccounts"] = "true"
++	props["GuestAccountsPermissions"] = "true"
++
+ 	if l != nil {
+ 		props["Id"] = l.Id
+ 		props["SkuName"] = l.SkuName
+@@ -254,8 +259,6 @@ func GetClientLicense(l *model.License) map[string]string {
+ 		props["EmailNotificationContents"] = strconv.FormatBool(*l.Features.EmailNotificationContents)
+ 		props["MessageExport"] = strconv.FormatBool(*l.Features.MessageExport)
+ 		props["CustomPermissionsSchemes"] = strconv.FormatBool(*l.Features.CustomPermissionsSchemes)
+-		props["GuestAccounts"] = strconv.FormatBool(*l.Features.GuestAccounts)
+-		props["GuestAccountsPermissions"] = strconv.FormatBool(*l.Features.GuestAccountsPermissions)
+ 		props["CustomTermsOfService"] = strconv.FormatBool(*l.Features.CustomTermsOfService)
+ 		props["LockTeammateNameDisplay"] = strconv.FormatBool(*l.Features.LockTeammateNameDisplay)
+ 		props["Cloud"] = strconv.FormatBool(*l.Features.Cloud)
+-- 
+2.53.0

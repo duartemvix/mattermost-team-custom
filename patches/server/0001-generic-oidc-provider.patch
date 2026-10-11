@@ -1,0 +1,2028 @@
+diff --git a/server/channels/app/oauthproviders/openid/discovery.go b/server/channels/app/oauthproviders/openid/discovery.go
+new file mode 100644
+index 00000000..6872198a
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/discovery.go
+@@ -0,0 +1,300 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package oauthopenid
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++	"time"
++
++	"golang.org/x/sync/singleflight"
++
++	"github.com/mattermost/mattermost/server/public/shared/httpservice"
++	"github.com/mattermost/mattermost/server/public/shared/mlog"
++	"github.com/mattermost/mattermost/server/public/shared/request"
++)
++
++const (
++	// discoveryTTL is how long a successfully fetched discovery document is
++	// reused. Discovery documents change rarely, and re-fetching one on every
++	// login would put the identity provider in the critical path twice.
++	discoveryTTL = time.Hour
++
++	// discoveryFailureTTL is how long a failed fetch is remembered. It is short
++	// so that a transient outage of the identity provider does not keep logins
++	// broken for long, but long enough that a provider which is down does not
++	// get a request per login attempt.
++	discoveryFailureTTL = 30 * time.Second
++
++	// discoveryTimeout bounds the whole discovery request.
++	discoveryTimeout = 10 * time.Second
++
++	// maxDiscoverySize bounds the discovery document we are willing to read.
++	maxDiscoverySize = 1 << 20 // 1MB
++
++	// maxDiscoveryRedirects bounds the redirect chain of a discovery request.
++	maxDiscoveryRedirects = 5
++
++	// wellKnownPath is appended when the configured endpoint is a bare issuer
++	// URL, as described by OpenID Connect Discovery 1.0, section 4.
++	wellKnownPath = "/.well-known/openid-configuration"
++)
++
++// discoveryDocument holds the subset of the OpenID Connect provider metadata
++// that Mattermost needs.
++type discoveryDocument struct {
++	Issuer                string `json:"issuer"`
++	AuthorizationEndpoint string `json:"authorization_endpoint"`
++	TokenEndpoint         string `json:"token_endpoint"`
++	UserInfoEndpoint      string `json:"userinfo_endpoint"`
++}
++
++// IsValid checks the document against the host it was fetched from.
++//
++// Binding the issuer to that host is what keeps a substituted document from
++// being usable: without it, anything that could answer the discovery request
++// could hand us its own token endpoint and Mattermost would POST the client
++// secret of the real identity provider to it.
++func (d *discoveryDocument) IsValid(discoveryHost string) error {
++	if d.Issuer == "" {
++		return errors.New("the discovery document has no issuer")
++	}
++
++	issuer, err := validateHTTPSURL(d.Issuer)
++	if err != nil {
++		return fmt.Errorf("the issuer of the discovery document is invalid: %w", err)
++	}
++
++	if !strings.EqualFold(issuer.Host, discoveryHost) {
++		return fmt.Errorf("the issuer %q of the discovery document does not match the discovery host %q", d.Issuer, discoveryHost)
++	}
++
++	for _, endpoint := range []struct {
++		name  string
++		value string
++	}{
++		{"authorization_endpoint", d.AuthorizationEndpoint},
++		{"token_endpoint", d.TokenEndpoint},
++		{"userinfo_endpoint", d.UserInfoEndpoint},
++	} {
++		if endpoint.value == "" {
++			return fmt.Errorf("the discovery document has no %s", endpoint.name)
++		}
++		if _, err := validateHTTPSURL(endpoint.value); err != nil {
++			return fmt.Errorf("the %s of the discovery document is invalid: %w", endpoint.name, err)
++		}
++	}
++
++	return nil
++}
++
++type discoveryEntry struct {
++	document  *discoveryDocument
++	err       error
++	expiresAt time.Time
++}
++
++type discoveryCache struct {
++	mut         sync.Mutex
++	entries     map[string]discoveryEntry
++	group       singleflight.Group
++	httpService httpservice.HTTPService
++	now         func() time.Time
++}
++
++// newDiscoveryCache builds a cache whose requests go through httpService, so
++// that discovery is subject to AllowedUntrustedInternalConnections exactly like
++// the token and userinfo requests made by App.AuthorizeOAuthUser. Without it a
++// discovery endpoint would be a way to make the server reach into its own
++// network.
++func newDiscoveryCache(httpService httpservice.HTTPService) *discoveryCache {
++	return &discoveryCache{
++		entries:     make(map[string]discoveryEntry),
++		httpService: httpService,
++		now:         time.Now,
++	}
++}
++
++// client builds the client for a single discovery request. It is built per
++// request rather than kept around because httpservice reads part of the
++// outbound connection policy when the transport is made, and the provider is
++// constructed from init(), before there is any configuration to read.
++func (c *discoveryCache) client() *http.Client {
++	client := c.httpService.MakeClient(false)
++	client.Timeout = discoveryTimeout
++	client.CheckRedirect = checkDiscoveryRedirect
++
++	return client
++}
++
++// checkDiscoveryRedirect bounds the redirect chain and keeps it on the
++// configured host over https.
++func checkDiscoveryRedirect(req *http.Request, via []*http.Request) error {
++	if len(via) >= maxDiscoveryRedirects {
++		return fmt.Errorf("stopped after %d redirects", maxDiscoveryRedirects)
++	}
++
++	if _, err := validateHTTPSURL(req.URL.String()); err != nil {
++		return fmt.Errorf("the discovery endpoint redirected to an invalid URL: %w", err)
++	}
++
++	// Only same host redirects are followed. A redirect elsewhere would let
++	// whoever controls the configured host substitute a whole document, and the
++	// issuer check in IsValid, which compares against the configured host,
++	// would no longer say anything about the endpoints we end up using.
++	if origin := via[0].URL; !strings.EqualFold(req.URL.Host, origin.Host) {
++		return fmt.Errorf("the discovery endpoint redirected from host %q to host %q", origin.Host, req.URL.Host)
++	}
++
++	return nil
++}
++
++// get returns the discovery document for the given endpoint, fetching it only
++// when there is no unexpired cached copy. Concurrent callers for the same
++// endpoint share a single fetch instead of queueing behind a lock, and failures
++// are cached briefly so that a provider which is down is not hammered.
++func (c *discoveryCache) get(rctx request.CTX, endpoint string) (*discoveryDocument, error) {
++	parsed, err := discoveryURL(endpoint)
++	if err != nil {
++		return nil, err
++	}
++	key := parsed.String()
++
++	if entry, ok := c.lookup(key); ok {
++		return entry.document, entry.err
++	}
++
++	result, err, _ := c.group.Do(key, func() (any, error) {
++		// Another caller may have filled the cache while this call was queued.
++		if entry, ok := c.lookup(key); ok {
++			return entry.document, entry.err
++		}
++
++		doc, err := c.fetch(rctx, parsed)
++		c.store(key, doc, err)
++
++		return doc, err
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	doc, _ := result.(*discoveryDocument)
++	if doc == nil {
++		return nil, errors.New("the discovery document could not be resolved")
++	}
++
++	return doc, nil
++}
++
++func (c *discoveryCache) lookup(key string) (discoveryEntry, bool) {
++	c.mut.Lock()
++	defer c.mut.Unlock()
++
++	entry, ok := c.entries[key]
++	if !ok || !c.now().Before(entry.expiresAt) {
++		return discoveryEntry{}, false
++	}
++
++	return entry, true
++}
++
++func (c *discoveryCache) store(key string, doc *discoveryDocument, err error) {
++	ttl := discoveryTTL
++	if err != nil {
++		ttl = discoveryFailureTTL
++	}
++
++	c.mut.Lock()
++	defer c.mut.Unlock()
++
++	c.entries[key] = discoveryEntry{document: doc, err: err, expiresAt: c.now().Add(ttl)}
++}
++
++func (c *discoveryCache) fetch(rctx request.CTX, target *url.URL) (*discoveryDocument, error) {
++	ctx, cancel := context.WithTimeout(rctx.Context(), discoveryTimeout)
++	defer cancel()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Accept", "application/json")
++
++	rctx.Logger().Debug("Fetching OpenID Connect discovery document", mlog.String("url", target.String()))
++
++	resp, err := c.client().Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDiscoverySize))
++		resp.Body.Close()
++	}()
++
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("the discovery endpoint returned status %d", resp.StatusCode)
++	}
++
++	var doc discoveryDocument
++	if err = json.NewDecoder(io.LimitReader(resp.Body, maxDiscoverySize)).Decode(&doc); err != nil {
++		return nil, fmt.Errorf("unable to decode the discovery document: %w", err)
++	}
++
++	if err = doc.IsValid(target.Host); err != nil {
++		return nil, err
++	}
++
++	return &doc, nil
++}
++
++// discoveryURL normalizes the configured endpoint. A bare issuer URL gets the
++// well known path appended, as most administrators paste the issuer.
++func discoveryURL(endpoint string) (*url.URL, error) {
++	parsed, err := validateHTTPSURL(endpoint)
++	if err != nil {
++		return nil, fmt.Errorf("the discovery endpoint is invalid: %w", err)
++	}
++
++	if !strings.Contains(parsed.Path, "/.well-known/") {
++		parsed.Path = strings.TrimSuffix(parsed.Path, "/") + wellKnownPath
++	}
++
++	return parsed, nil
++}
++
++// validateHTTPSURL parses raw and requires an absolute https URL.
++//
++// TLS is mandatory for every endpoint this provider resolves, and there is
++// deliberately no opt-out, not even for development. The provider does not
++// verify the signature of the ID token and cannot verify the userinfo response
++// at all (see parseIDToken), so the authenticity of both rests entirely on the
++// TLS connection to the endpoints resolved here. Over plain http an on-path
++// attacker can forge the discovery document, the ID token and the userinfo
++// body, which is a full authentication bypass. A setting that turns that off
++// is one misconfiguration away from a production server, so developers who need
++// a local identity provider should terminate TLS in front of it instead.
++func validateHTTPSURL(raw string) (*url.URL, error) {
++	parsed, err := url.Parse(strings.TrimSpace(raw))
++	if err != nil {
++		return nil, err
++	}
++
++	if parsed.Scheme != "https" {
++		return nil, fmt.Errorf("the URL must use https, got scheme %q", parsed.Scheme)
++	}
++
++	if parsed.Host == "" {
++		return nil, errors.New("the URL has no host")
++	}
++
++	return parsed, nil
++}
+diff --git a/server/channels/app/oauthproviders/openid/discovery_test.go b/server/channels/app/oauthproviders/openid/discovery_test.go
+new file mode 100644
+index 00000000..d834c827
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/discovery_test.go
+@@ -0,0 +1,453 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package oauthopenid
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/mattermost/mattermost/server/public/model"
++	"github.com/mattermost/mattermost/server/public/shared/httpservice"
++	"github.com/mattermost/mattermost/server/public/shared/request"
++)
++
++// staticConfigService hands a fixed configuration to httpservice.
++type staticConfigService struct {
++	config *model.Config
++}
++
++func (s *staticConfigService) Config() *model.Config {
++	return s.config
++}
++
++// testConfig returns a configuration that lets the guarded transport reach the
++// given httptest TLS servers. Both settings are needed: an httptest server
++// listens on a loopback address, which is in a reserved range, and it presents
++// a self signed certificate.
++func testConfig(servers ...*httptest.Server) *model.Config {
++	cfg := &model.Config{}
++	cfg.SetDefaults()
++	cfg.ServiceSettings.EnableInsecureOutgoingConnections = model.NewPointer(true)
++	cfg.ServiceSettings.AllowedUntrustedInternalConnections = model.NewPointer(allowlistFor(servers...))
++
++	return cfg
++}
++
++func allowlistFor(servers ...*httptest.Server) string {
++	hosts := make([]string, 0, len(servers))
++	for _, server := range servers {
++		parsed, err := url.Parse(server.URL)
++		if err != nil {
++			panic(err)
++		}
++		hosts = append(hosts, parsed.Hostname())
++	}
++
++	return strings.Join(hosts, " ")
++}
++
++func newTestCache(cfg *model.Config) *discoveryCache {
++	return newDiscoveryCache(httpservice.MakeHTTPService(&staticConfigService{config: cfg}))
++}
++
++// discoveryBody renders a document whose issuer and endpoints all live on
++// issuer, which is what the issuer binding requires.
++func discoveryBody(issuer string) string {
++	return fmt.Sprintf(`{
++		"issuer": %q,
++		"authorization_endpoint": "%s/auth",
++		"token_endpoint": "%s/token",
++		"userinfo_endpoint": "%s/userinfo"
++	}`, issuer, issuer, issuer, issuer)
++}
++
++func newDiscoveryServer(t *testing.T, body func() string) *httptest.Server {
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(body()))
++	}))
++	t.Cleanup(server.Close)
++
++	return server
++}
++
++func TestDiscoveryURL(t *testing.T) {
++	for _, tc := range []struct {
++		in       string
++		expected string
++	}{
++		{"https://idp.example.com", "https://idp.example.com/.well-known/openid-configuration"},
++		{"https://idp.example.com/", "https://idp.example.com/.well-known/openid-configuration"},
++		{"https://idp.example.com/realms/mm", "https://idp.example.com/realms/mm/.well-known/openid-configuration"},
++		{"  https://idp.example.com/.well-known/openid-configuration  ", "https://idp.example.com/.well-known/openid-configuration"},
++	} {
++		t.Run(tc.in, func(t *testing.T) {
++			got, err := discoveryURL(tc.in)
++			require.NoError(t, err)
++			assert.Equal(t, tc.expected, got.String())
++		})
++	}
++
++	// http is rejected along with the rest: the ID token signature is not
++	// verified, so everything rests on TLS to the discovered endpoints.
++	for _, in := range []string{
++		"",
++		"http://idp.example.com",
++		"http://localhost:8080/realms/mm",
++		"HTTP://idp.example.com",
++		"file:///etc/passwd",
++		"idp.example.com",
++		"javascript:alert(1)",
++		"https://",
++	} {
++		t.Run("rejects "+in, func(t *testing.T) {
++			_, err := discoveryURL(in)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestDiscoveryDocumentIsValid(t *testing.T) {
++	valid := func() *discoveryDocument {
++		return &discoveryDocument{
++			Issuer:                "https://idp.example.com",
++			AuthorizationEndpoint: "https://idp.example.com/auth",
++			TokenEndpoint:         "https://idp.example.com/token",
++			UserInfoEndpoint:      "https://idp.example.com/userinfo",
++		}
++	}
++
++	t.Run("valid", func(t *testing.T) {
++		require.NoError(t, valid().IsValid("idp.example.com"))
++	})
++
++	t.Run("the issuer host must match the discovery host", func(t *testing.T) {
++		err := valid().IsValid("attacker.example.net")
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "does not match")
++	})
++
++	t.Run("the issuer host is compared case insensitively", func(t *testing.T) {
++		doc := valid()
++		doc.Issuer = "https://IDP.example.com"
++		require.NoError(t, doc.IsValid("idp.example.COM"))
++	})
++
++	t.Run("an http issuer is rejected", func(t *testing.T) {
++		doc := valid()
++		doc.Issuer = "http://idp.example.com"
++		err := doc.IsValid("idp.example.com")
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "https")
++	})
++
++	for _, tc := range []struct{ name, endpoint string }{
++		{"authorization_endpoint", "http://idp.example.com/auth"},
++		{"token_endpoint", "http://idp.example.com/token"},
++		{"userinfo_endpoint", "http://idp.example.com/userinfo"},
++	} {
++		t.Run("an http "+tc.name+" is rejected", func(t *testing.T) {
++			doc := valid()
++			switch tc.name {
++			case "authorization_endpoint":
++				doc.AuthorizationEndpoint = tc.endpoint
++			case "token_endpoint":
++				doc.TokenEndpoint = tc.endpoint
++			case "userinfo_endpoint":
++				doc.UserInfoEndpoint = tc.endpoint
++			}
++
++			err := doc.IsValid("idp.example.com")
++			require.Error(t, err)
++			assert.Contains(t, err.Error(), tc.name)
++			assert.Contains(t, err.Error(), "https")
++		})
++	}
++}
++
++func TestDiscoveryFetch(t *testing.T) {
++	rctx := request.TestContext(t)
++
++	t.Run("valid document", func(t *testing.T) {
++		var server *httptest.Server
++		server = newDiscoveryServer(t, func() string { return discoveryBody(server.URL) })
++
++		doc, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.NoError(t, err)
++		assert.Equal(t, server.URL, doc.Issuer)
++		assert.Equal(t, server.URL+"/token", doc.TokenEndpoint)
++	})
++
++	t.Run("the accept header is sent", func(t *testing.T) {
++		var accept string
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			accept = r.Header.Get("Accept")
++			_, _ = w.Write([]byte(discoveryBody(server.URL)))
++		}))
++		defer server.Close()
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.NoError(t, err)
++		assert.Equal(t, "application/json", accept)
++	})
++
++	t.Run("incomplete document", func(t *testing.T) {
++		var server *httptest.Server
++		server = newDiscoveryServer(t, func() string {
++			return fmt.Sprintf(`{"issuer":%q,"authorization_endpoint":"%s/auth"}`, server.URL, server.URL)
++		})
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "token_endpoint")
++	})
++
++	t.Run("document with a non https endpoint", func(t *testing.T) {
++		var server *httptest.Server
++		server = newDiscoveryServer(t, func() string {
++			return fmt.Sprintf(`{
++				"issuer":%q,
++				"authorization_endpoint":"http://idp.example.com/auth",
++				"token_endpoint":"%s/token",
++				"userinfo_endpoint":"%s/userinfo"
++			}`, server.URL, server.URL, server.URL)
++		})
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "authorization_endpoint")
++	})
++
++	t.Run("document whose issuer is another host", func(t *testing.T) {
++		var server *httptest.Server
++		server = newDiscoveryServer(t, func() string { return discoveryBody("https://attacker.example.net") })
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "does not match")
++	})
++
++	t.Run("malformed document", func(t *testing.T) {
++		server := newDiscoveryServer(t, func() string { return `<html>nope</html>` })
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "unable to decode")
++	})
++
++	t.Run("oversized document", func(t *testing.T) {
++		var server *httptest.Server
++		server = newDiscoveryServer(t, func() string {
++			return fmt.Sprintf(`{"issuer":%q,"padding":"%s"}`, server.URL, strings.Repeat("a", maxDiscoverySize))
++		})
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.Error(t, err)
++	})
++
++	t.Run("redirect loop is stopped", func(t *testing.T) {
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			http.Redirect(w, r, server.URL+wellKnownPath, http.StatusFound)
++		}))
++		defer server.Close()
++
++		_, err := newTestCache(testConfig(server)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "redirects")
++	})
++
++	t.Run("a redirect to another host is refused", func(t *testing.T) {
++		var elsewhere *httptest.Server
++		elsewhere = newDiscoveryServer(t, func() string { return discoveryBody(elsewhere.URL) })
++
++		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			http.Redirect(w, r, elsewhere.URL+wellKnownPath, http.StatusFound)
++		}))
++		defer server.Close()
++
++		// Both hosts are reachable, so only the same host rule can stop this.
++		_, err := newTestCache(testConfig(server, elsewhere)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "redirected from host")
++	})
++
++	t.Run("a redirect to http is refused", func(t *testing.T) {
++		plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusOK)
++		}))
++		defer plain.Close()
++
++		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			http.Redirect(w, r, plain.URL+wellKnownPath, http.StatusFound)
++		}))
++		defer server.Close()
++
++		_, err := newTestCache(testConfig(server, plain)).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "https")
++	})
++
++	t.Run("the outbound connection policy is enforced", func(t *testing.T) {
++		var server *httptest.Server
++		server = newDiscoveryServer(t, func() string { return discoveryBody(server.URL) })
++
++		// An empty allowlist is the default, and an httptest server listens on a
++		// loopback address, which is in a reserved range.
++		_, err := newTestCache(testConfig()).get(rctx, server.URL)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), httpservice.ErrAddressForbidden.Error())
++	})
++}
++
++func TestDiscoveryCache(t *testing.T) {
++	rctx := request.TestContext(t)
++
++	t.Run("successful fetches are cached until the ttl expires", func(t *testing.T) {
++		var hits int
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			hits++
++			_, _ = w.Write([]byte(discoveryBody(server.URL)))
++		}))
++		defer server.Close()
++
++		now := time.Now()
++		cache := newTestCache(testConfig(server))
++		cache.now = func() time.Time { return now }
++
++		for range 5 {
++			_, err := cache.get(rctx, server.URL)
++			require.NoError(t, err)
++		}
++		assert.Equal(t, 1, hits)
++
++		now = now.Add(discoveryTTL + time.Second)
++		_, err := cache.get(rctx, server.URL)
++		require.NoError(t, err)
++		assert.Equal(t, 2, hits)
++	})
++
++	t.Run("failures are cached briefly and then retried", func(t *testing.T) {
++		var hits int
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			hits++
++			if hits < 2 {
++				w.WriteHeader(http.StatusServiceUnavailable)
++				return
++			}
++			_, _ = w.Write([]byte(discoveryBody(server.URL)))
++		}))
++		defer server.Close()
++
++		now := time.Now()
++		cache := newTestCache(testConfig(server))
++		cache.now = func() time.Time { return now }
++
++		for i := range 5 {
++			_, err := cache.get(rctx, server.URL)
++			require.Error(t, err, fmt.Sprintf("attempt %d", i))
++		}
++		assert.Equal(t, 1, hits, "a failing provider must not be asked once per login")
++
++		now = now.Add(discoveryFailureTTL + time.Second)
++		doc, err := cache.get(rctx, server.URL)
++		require.NoError(t, err)
++		assert.Equal(t, server.URL, doc.Issuer)
++		assert.Equal(t, 2, hits)
++	})
++
++	t.Run("concurrent callers share a single fetch", func(t *testing.T) {
++		var hits atomic.Int64
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			hits.Add(1)
++			// Long enough that every goroutine is waiting on this one request.
++			time.Sleep(100 * time.Millisecond)
++			_, _ = w.Write([]byte(discoveryBody(server.URL)))
++		}))
++		defer server.Close()
++
++		cache := newTestCache(testConfig(server))
++
++		const callers = 25
++		var start sync.WaitGroup
++		var done sync.WaitGroup
++		start.Add(1)
++		done.Add(callers)
++
++		docs := make([]*discoveryDocument, callers)
++		errs := make([]error, callers)
++		for i := range callers {
++			go func() {
++				defer done.Done()
++				start.Wait()
++				docs[i], errs[i] = cache.get(rctx, server.URL)
++			}()
++		}
++
++		start.Done()
++		done.Wait()
++
++		for i := range callers {
++			require.NoError(t, errs[i], "caller %d", i)
++			require.NotNil(t, docs[i], "caller %d", i)
++			assert.Equal(t, server.URL+"/token", docs[i].TokenEndpoint)
++		}
++		assert.Equal(t, int64(1), hits.Load(), "a burst of logins must collapse into one discovery request")
++	})
++
++	t.Run("concurrent callers of a failing endpoint do not queue behind each other", func(t *testing.T) {
++		var hits atomic.Int64
++		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			hits.Add(1)
++			time.Sleep(100 * time.Millisecond)
++			w.WriteHeader(http.StatusServiceUnavailable)
++		}))
++		defer server.Close()
++
++		cache := newTestCache(testConfig(server))
++
++		const callers = 25
++		var start sync.WaitGroup
++		var done sync.WaitGroup
++		start.Add(1)
++		done.Add(callers)
++
++		errs := make([]error, callers)
++		for i := range callers {
++			go func() {
++				defer done.Done()
++				start.Wait()
++				_, errs[i] = cache.get(rctx, server.URL)
++			}()
++		}
++
++		started := time.Now()
++		start.Done()
++		done.Wait()
++		elapsed := time.Since(started)
++
++		for i := range callers {
++			require.Error(t, errs[i], "caller %d", i)
++		}
++
++		// Holding the cache lock across the fetch, or not remembering the
++		// failure, turns this into one 100ms request per caller.
++		assert.Equal(t, int64(1), hits.Load(), "an identity provider that is down must be asked once, not once per login")
++		assert.Less(t, elapsed, 5*time.Duration(callers)*time.Millisecond+time.Second, "callers must not serialize behind the failing fetch")
++	})
++}
+diff --git a/server/channels/app/oauthproviders/openid/idtoken.go b/server/channels/app/oauthproviders/openid/idtoken.go
+new file mode 100644
+index 00000000..904b125f
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/idtoken.go
+@@ -0,0 +1,101 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package oauthopenid
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++)
++
++const (
++	// maxIDTokenSize bounds the compact serialization we are willing to parse.
++	maxIDTokenSize = 64 * 1024
++
++	// clockSkew is the tolerance applied to the time based claims.
++	clockSkew = 2 * time.Minute
++)
++
++// idTokenClaims are the registered claims we validate, on top of the profile
++// claims of OpenIDUser.
++type idTokenClaims struct {
++	OpenIDUser
++	Issuer    string `json:"iss"`
++	ExpiresAt *int64 `json:"exp"`
++	IssuedAt  *int64 `json:"iat"`
++	NotBefore *int64 `json:"nbf"`
++}
++
++// parseIDToken decodes the payload of a JWS compact serialization.
++//
++// The signature is NOT verified. App.AuthorizeOAuthUser only calls
++// GetUserFromIdToken with the id_token of the token endpoint response, which
++// the server itself just fetched over a direct TLS connection to the token
++// endpoint configured by the administrator. OpenID Connect Core 1.0, section
++// 3.1.3.7 states that in exactly that case the signature check MAY be skipped
++// and TLS server authentication is used instead. The token never reaches us
++// from the browser, so an attacker cannot substitute one. That argument only
++// holds while the token endpoint is https, which validateSettings enforces for
++// every endpoint this provider resolves, discovered or configured by hand.
++//
++// Because there is no cryptographic proof, GetUserFromJSON treats the result as
++// unauthenticated: it is never a source of identity, only a subject to compare
++// against and a few cosmetic profile fields.
++func parseIDToken(idToken string, now time.Time) (*idTokenClaims, error) {
++	idToken = strings.TrimSpace(idToken)
++	if idToken == "" {
++		return nil, errors.New("the ID token is empty")
++	}
++
++	if len(idToken) > maxIDTokenSize {
++		return nil, errors.New("the ID token is too large")
++	}
++
++	parts := strings.Split(idToken, ".")
++	if len(parts) != 3 {
++		return nil, errors.New("the ID token is not a JWS compact serialization")
++	}
++
++	for i, part := range parts {
++		// The signature of an unsecured JWS is empty, the other segments are not.
++		if part == "" && i != 2 {
++			return nil, errors.New("the ID token has an empty segment")
++		}
++	}
++
++	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
++	if err != nil {
++		return nil, fmt.Errorf("unable to decode the ID token payload: %w", err)
++	}
++
++	var claims idTokenClaims
++	if err = json.Unmarshal(payload, &claims); err != nil {
++		return nil, fmt.Errorf("unable to decode the ID token claims: %w", err)
++	}
++
++	if strings.TrimSpace(string(claims.Subject)) == "" {
++		return nil, errors.New("the ID token has no sub claim")
++	}
++
++	if claims.ExpiresAt == nil {
++		return nil, errors.New("the ID token has no exp claim")
++	}
++
++	if now.After(time.Unix(*claims.ExpiresAt, 0).Add(clockSkew)) {
++		return nil, errors.New("the ID token has expired")
++	}
++
++	if claims.NotBefore != nil && now.Add(clockSkew).Before(time.Unix(*claims.NotBefore, 0)) {
++		return nil, errors.New("the ID token is not valid yet")
++	}
++
++	if claims.IssuedAt != nil && now.Add(clockSkew).Before(time.Unix(*claims.IssuedAt, 0)) {
++		return nil, errors.New("the ID token was issued in the future")
++	}
++
++	return &claims, nil
++}
+diff --git a/server/channels/app/oauthproviders/openid/idtoken_test.go b/server/channels/app/oauthproviders/openid/idtoken_test.go
+new file mode 100644
+index 00000000..cc23e398
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/idtoken_test.go
+@@ -0,0 +1,131 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package oauthopenid
++
++import (
++	"encoding/base64"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/mattermost/mattermost/server/public/shared/request"
++)
++
++func makeIDToken(payload string) string {
++	enc := base64.RawURLEncoding.EncodeToString
++	return enc([]byte(`{"alg":"RS256","typ":"JWT"}`)) + "." + enc([]byte(payload)) + "." + enc([]byte("not-a-real-signature"))
++}
++
++func TestParseIDToken(t *testing.T) {
++	now := time.Unix(1_700_000_000, 0)
++	future := now.Add(time.Hour).Unix()
++	past := now.Add(-time.Hour).Unix()
++
++	t.Run("valid token", func(t *testing.T) {
++		token := makeIDToken(`{"iss":"https://idp.example.com","sub":"abc-123","exp":` +
++			itoa(future) + `,"iat":` + itoa(past) + `,"email":"jane@example.com","given_name":"Jane","family_name":"Doe"}`)
++
++		claims, err := parseIDToken(token, now)
++		require.NoError(t, err)
++		assert.Equal(t, "abc-123", string(claims.Subject))
++		assert.Equal(t, "https://idp.example.com", claims.Issuer)
++		assert.Equal(t, "jane@example.com", claims.Email)
++	})
++
++	t.Run("expired token", func(t *testing.T) {
++		_, err := parseIDToken(makeIDToken(`{"sub":"a","exp":`+itoa(past)+`}`), now)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "expired")
++	})
++
++	t.Run("expiry within the clock skew is accepted", func(t *testing.T) {
++		_, err := parseIDToken(makeIDToken(`{"sub":"a","exp":`+itoa(now.Add(-time.Minute).Unix())+`}`), now)
++		require.NoError(t, err)
++	})
++
++	t.Run("missing exp", func(t *testing.T) {
++		_, err := parseIDToken(makeIDToken(`{"sub":"a"}`), now)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "exp")
++	})
++
++	t.Run("missing sub", func(t *testing.T) {
++		_, err := parseIDToken(makeIDToken(`{"exp":`+itoa(future)+`}`), now)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "sub")
++	})
++
++	t.Run("not yet valid", func(t *testing.T) {
++		_, err := parseIDToken(makeIDToken(`{"sub":"a","exp":`+itoa(future)+`,"nbf":`+itoa(future)+`}`), now)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "not valid yet")
++	})
++
++	t.Run("issued in the future", func(t *testing.T) {
++		_, err := parseIDToken(makeIDToken(`{"sub":"a","exp":`+itoa(future)+`,"iat":`+itoa(future)+`}`), now)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "future")
++	})
++
++	for _, tc := range []struct{ name, token string }{
++		{"empty", ""},
++		{"not a jwt", "abcdef"},
++		{"two segments", "aaa.bbb"},
++		{"empty header segment", ".bbb.ccc"},
++		{"payload not base64url", "aaa.!!!.ccc"},
++		{"payload not json", "aaa." + base64.RawURLEncoding.EncodeToString([]byte("nope")) + ".ccc"},
++		{"too large", strings.Repeat("a", maxIDTokenSize+1)},
++	} {
++		t.Run("rejects "+tc.name, func(t *testing.T) {
++			_, err := parseIDToken(tc.token, now)
++			require.Error(t, err)
++		})
++	}
++}
++
++func TestGetUserFromIdToken(t *testing.T) {
++	rctx := request.TestContext(t)
++	provider := New()
++	exp := itoa(time.Now().Add(time.Hour).Unix())
++
++	t.Run("empty token yields no user", func(t *testing.T) {
++		user, err := provider.GetUserFromIdToken(rctx, "")
++		require.NoError(t, err)
++		assert.Nil(t, user)
++	})
++
++	t.Run("claims are mapped", func(t *testing.T) {
++		token := makeIDToken(`{"sub":"abc","exp":` + exp + `,"email":"Jane@Example.com","name":"Jane Doe","nickname":"janey"}`)
++
++		user, err := provider.GetUserFromIdToken(rctx, token)
++		require.NoError(t, err)
++		assert.Equal(t, "abc", *user.AuthData)
++		assert.Equal(t, "jane@example.com", user.Email)
++		assert.Equal(t, "Jane", user.FirstName)
++		assert.Equal(t, "Doe", user.LastName)
++		assert.Equal(t, "janey", user.Nickname)
++		assert.Empty(t, user.Username, "the username comes from the userinfo response only")
++	})
++
++	t.Run("unverified email is rejected", func(t *testing.T) {
++		token := makeIDToken(`{"sub":"abc","exp":` + exp + `,"email":"jane@example.com","email_verified":false}`)
++
++		_, err := provider.GetUserFromIdToken(rctx, token)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "unverified")
++	})
++
++	t.Run("garbage is rejected", func(t *testing.T) {
++		_, err := provider.GetUserFromIdToken(rctx, "not.a.token")
++		require.Error(t, err)
++	})
++}
++
++func itoa(v int64) string {
++	return strconv.FormatInt(v, 10)
++}
+diff --git a/server/channels/app/oauthproviders/openid/openid.go b/server/channels/app/oauthproviders/openid/openid.go
+new file mode 100644
+index 00000000..39c059d4
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/openid.go
+@@ -0,0 +1,457 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++// Package oauthopenid implements einterfaces.OAuthProvider for any standard
++// OpenID Connect identity provider.
++//
++// It is registered under the "openid" service name. App.getSSOProvider routes
++// every SSO service whose configured scope contains "openid" to this provider,
++// so a GitLab, Google or Office 365 configuration using the OpenID Connect
++// scope is handled here as well, while the same configuration without that
++// scope keeps using its dedicated provider. GetSSOSettings therefore accepts
++// every service name Config.GetSSOService knows.
++package oauthopenid
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"github.com/mattermost/mattermost/server/public/model"
++	"github.com/mattermost/mattermost/server/public/shared/httpservice"
++	"github.com/mattermost/mattermost/server/public/shared/mlog"
++	"github.com/mattermost/mattermost/server/public/shared/request"
++)
++
++// maxUserInfoSize bounds the userinfo document we are willing to decode. The
++// body is produced by the identity provider, but a misbehaving or compromised
++// one should not be able to make us allocate without limit.
++const maxUserInfoSize = 1 << 20 // 1MB
++
++// requestConfig adapts the *model.Config of the request being served to the
++// interface httpservice expects. OAuth providers are registered from init(),
++// long before a Server exists to hand its HTTPService over, so the provider
++// builds one over the configuration it is handed on every call.
++type requestConfig struct {
++	config atomic.Pointer[model.Config]
++}
++
++func (c *requestConfig) set(config *model.Config) {
++	c.config.Store(config)
++}
++
++func (c *requestConfig) Config() *model.Config {
++	if config := c.config.Load(); config != nil {
++		return config
++	}
++
++	// Nothing has been served yet, so there is no allowlist to read. An empty
++	// configuration is the strictest one: no internal host is allowed and
++	// insecure outgoing connections are off.
++	return &model.Config{}
++}
++
++// OpenIDProvider implements einterfaces.OAuthProvider for generic OpenID
++// Connect identity providers.
++type OpenIDProvider struct {
++	config    requestConfig
++	discovery *discoveryCache
++}
++
++// New returns a provider with its own discovery document cache, making its
++// outbound requests through httpservice over the configuration of the request
++// being served.
++func New() *OpenIDProvider {
++	p := &OpenIDProvider{}
++	p.discovery = newDiscoveryCache(httpservice.MakeHTTPService(&p.config))
++
++	return p
++}
++
++// NewWithHTTPService returns a provider that makes its outbound requests with
++// the given service instead of one built per request. Tests use it to inject a
++// service over a fixed configuration.
++func NewWithHTTPService(httpService httpservice.HTTPService) *OpenIDProvider {
++	return &OpenIDProvider{discovery: newDiscoveryCache(httpService)}
++}
++
++// OpenIDUser holds the standard OpenID Connect claims Mattermost cares about.
++// It is used both for the userinfo response and for the ID token payload.
++type OpenIDUser struct {
++	Subject           flexibleString  `json:"sub"`
++	Email             string          `json:"email"`
++	EmailVerified     json.RawMessage `json:"email_verified"`
++	PreferredUsername string          `json:"preferred_username"`
++	Name              string          `json:"name"`
++	GivenName         string          `json:"given_name"`
++	FamilyName        string          `json:"family_name"`
++	Nickname          string          `json:"nickname"`
++}
++
++// flexibleString decodes a JSON string or number into a string. The
++// specification requires "sub" to be a string, but a handful of providers send
++// a bare number and there is no reason to fail the login over it. Anything else
++// is rejected: an object or an array would otherwise end up in AuthData as raw
++// JSON.
++type flexibleString string
++
++func (s *flexibleString) UnmarshalJSON(data []byte) error {
++	trimmed := strings.TrimSpace(string(data))
++	if trimmed == "" || trimmed == "null" {
++		*s = ""
++		return nil
++	}
++
++	if strings.HasPrefix(trimmed, `"`) {
++		var str string
++		if err := json.Unmarshal(data, &str); err != nil {
++			return err
++		}
++		*s = flexibleString(strings.TrimSpace(str))
++		return nil
++	}
++
++	var number json.Number
++	if err := json.Unmarshal(data, &number); err != nil {
++		return fmt.Errorf("the sub claim must be a string or a number: %w", err)
++	}
++	*s = flexibleString(number.String())
++
++	return nil
++}
++
++// isEmailVerified reports what the identity provider claimed about the email
++// address. The claim is a boolean in the specification, but providers send it
++// as a number or as a string too, so all three are accepted and strings are
++// parsed case insensitively.
++//
++// A claim that is present but cannot be read as a boolean is an error: the
++// provider meant to say something and we cannot tell what.
++//
++// An absent claim is deliberately treated as "not asserted" and does not block
++// the login, because a large share of identity providers never send it and
++// requiring it would break them. That choice has a cost worth knowing about:
++// App.CreateOAuthUser sets EmailVerified = true on the new account regardless,
++// so for those providers Mattermost marks an address verified on nobody's word
++// but the provider's.
++func (u *OpenIDUser) isEmailVerified() (verified bool, asserted bool, err error) {
++	raw := strings.TrimSpace(string(u.EmailVerified))
++	if raw == "" || raw == "null" {
++		return false, false, nil
++	}
++
++	var value any
++	if err = json.Unmarshal(u.EmailVerified, &value); err != nil {
++		return false, true, fmt.Errorf("the email_verified claim is not valid JSON: %w", err)
++	}
++
++	switch typed := value.(type) {
++	case bool:
++		return typed, true, nil
++	case float64:
++		return typed != 0, true, nil
++	case string:
++		parsed, parseErr := strconv.ParseBool(strings.ToLower(strings.TrimSpace(typed)))
++		if parseErr != nil {
++			return false, true, fmt.Errorf("the email_verified claim %q is not a boolean", typed)
++		}
++		return parsed, true, nil
++	}
++
++	return false, true, fmt.Errorf("the email_verified claim has an unexpected type %T", value)
++}
++
++func (u *OpenIDUser) IsValid() error {
++	if string(u.Subject) == "" {
++		return errors.New("the sub claim is missing from the OpenID Connect response")
++	}
++
++	if u.Email == "" {
++		return errors.New("the email claim is missing from the OpenID Connect response")
++	}
++
++	verified, asserted, err := u.isEmailVerified()
++	if err != nil {
++		return err
++	}
++	if asserted && !verified {
++		return fmt.Errorf("the identity provider reports the email address of subject %q as unverified", string(u.Subject))
++	}
++
++	return nil
++}
++
++func openIDUserFromJSON(data io.Reader) (*OpenIDUser, error) {
++	var oiu OpenIDUser
++	if err := json.NewDecoder(io.LimitReader(data, maxUserInfoSize)).Decode(&oiu); err != nil {
++		return nil, err
++	}
++	return &oiu, nil
++}
++
++// usernameFrom derives a valid Mattermost username from the available claims.
++// model.CleanUsername lowercases the result, replaces the characters that are
++// not allowed and generates a random username as a last resort, so this never
++// fails the login.
++func usernameFrom(logger mlog.LoggerIFace, oiu *OpenIDUser, settings *model.SSOSettings) string {
++	var username string
++
++	switch {
++	case settings != nil && model.SafeDereference(settings.UsePreferredUsername) && oiu.PreferredUsername != "":
++		// Consistent with the other providers: a preferred username that looks
++		// like an address is reduced to its local part.
++		username = strings.Split(oiu.PreferredUsername, "@")[0]
++	case oiu.Email != "":
++		username = strings.Split(oiu.Email, "@")[0]
++	case oiu.PreferredUsername != "":
++		username = strings.Split(oiu.PreferredUsername, "@")[0]
++	case oiu.Nickname != "":
++		username = oiu.Nickname
++	case oiu.Name != "":
++		username = oiu.Name
++	default:
++		username = string(oiu.Subject)
++	}
++
++	return model.CleanUsername(logger, username)
++}
++
++// namesFrom returns the first and last name, preferring the discrete claims
++// and falling back to splitting the display name.
++func namesFrom(oiu *OpenIDUser) (firstName, lastName string) {
++	if oiu.GivenName != "" || oiu.FamilyName != "" {
++		return oiu.GivenName, oiu.FamilyName
++	}
++
++	splitName := strings.Fields(oiu.Name)
++	switch len(splitName) {
++	case 0:
++		return "", ""
++	case 1:
++		return splitName[0], ""
++	default:
++		return splitName[0], strings.Join(splitName[1:], " ")
++	}
++}
++
++func userFromOpenIDUser(logger mlog.LoggerIFace, oiu *OpenIDUser, settings *model.SSOSettings) *model.User {
++	user := &model.User{}
++
++	user.Username = usernameFrom(logger, oiu, settings)
++	user.FirstName, user.LastName = namesFrom(oiu)
++	user.Nickname = oiu.Nickname
++	user.Email = strings.ToLower(oiu.Email)
++
++	authData := string(oiu.Subject)
++	user.AuthData = &authData
++
++	// AuthService is deliberately left empty. This provider serves several
++	// service names and the caller fills in the service it was invoked with,
++	// which IsSameUser then relies on.
++
++	return user
++}
++
++// GetUserFromJSON parses a standard OpenID Connect userinfo response.
++//
++// The identity always comes from the userinfo response, which was fetched over
++// TLS with the access token. tokenUser, when set, is the result of
++// GetUserFromIdToken. That token is not signature verified (see
++// GetUserFromIdToken), so it is never a source of identity: the subject is only
++// compared against it, as required by OpenID Connect Core 5.3.2, and the email
++// address is never taken from it. Only cosmetic profile fields are filled in
++// from it.
++func (p *OpenIDProvider) GetUserFromJSON(rctx request.CTX, data io.Reader, tokenUser *model.User, settings *model.SSOSettings) (*model.User, error) {
++	oiu, err := openIDUserFromJSON(data)
++	if err != nil {
++		return nil, err
++	}
++
++	if string(oiu.Subject) == "" {
++		return nil, errors.New("the sub claim is missing from the userinfo response")
++	}
++
++	if tokenUser != nil && tokenUser.AuthData != nil && *tokenUser.AuthData != "" &&
++		*tokenUser.AuthData != string(oiu.Subject) {
++		return nil, errors.New("the subject of the ID token does not match the subject of the userinfo response")
++	}
++
++	if err = oiu.IsValid(); err != nil {
++		return nil, err
++	}
++
++	user := userFromOpenIDUser(rctx.Logger(), oiu, settings)
++
++	if tokenUser != nil {
++		if user.FirstName == "" && user.LastName == "" {
++			user.FirstName = tokenUser.FirstName
++			user.LastName = tokenUser.LastName
++		}
++		if user.Nickname == "" {
++			user.Nickname = tokenUser.Nickname
++		}
++	}
++
++	return user, nil
++}
++
++// GetSSOSettings returns the settings of the requested service, resolving the
++// OpenID Connect discovery document when the endpoints were not configured by
++// hand. The returned value is a copy: the configuration owned by the server is
++// never mutated.
++func (p *OpenIDProvider) GetSSOSettings(rctx request.CTX, config *model.Config, service string) (*model.SSOSettings, error) {
++	// App.getSSOProvider routes any service whose scope contains "openid" here,
++	// which includes google and office365, so every service GetSSOService knows
++	// has to be handled.
++	configured := config.GetSSOService(service)
++	if configured == nil {
++		return nil, fmt.Errorf("the %q service is not handled by the OpenID Connect provider", service)
++	}
++
++	if !model.SafeDereference(configured.Enable) {
++		return nil, fmt.Errorf("the %q service is not enabled", service)
++	}
++
++	// Discovery goes through httpservice, which reads the outbound connection
++	// policy from the configuration of the request being served.
++	p.config.set(config)
++
++	settings := *configured
++
++	discoveryEndpoint := strings.TrimSpace(model.SafeDereference(settings.DiscoveryEndpoint))
++	needsDiscovery := model.SafeDereference(settings.AuthEndpoint) == "" ||
++		model.SafeDereference(settings.TokenEndpoint) == "" ||
++		model.SafeDereference(settings.UserAPIEndpoint) == ""
++
++	if needsDiscovery && discoveryEndpoint != "" {
++		doc, err := p.discovery.get(rctx, discoveryEndpoint)
++		if err != nil {
++			return nil, fmt.Errorf("unable to resolve the OpenID Connect discovery document for the %q service: %w", service, err)
++		}
++
++		if model.SafeDereference(settings.AuthEndpoint) == "" {
++			settings.AuthEndpoint = model.NewPointer(doc.AuthorizationEndpoint)
++		}
++		if model.SafeDereference(settings.TokenEndpoint) == "" {
++			settings.TokenEndpoint = model.NewPointer(doc.TokenEndpoint)
++		}
++		if model.SafeDereference(settings.UserAPIEndpoint) == "" {
++			settings.UserAPIEndpoint = model.NewPointer(doc.UserInfoEndpoint)
++		}
++	}
++
++	if err := validateSettings(&settings, service); err != nil {
++		return nil, err
++	}
++
++	return &settings, nil
++}
++
++func validateSettings(settings *model.SSOSettings, service string) error {
++	missing := []string{}
++	if model.SafeDereference(settings.Id) == "" {
++		missing = append(missing, "Id")
++	}
++	if model.SafeDereference(settings.Secret) == "" {
++		missing = append(missing, "Secret")
++	}
++	if model.SafeDereference(settings.AuthEndpoint) == "" {
++		missing = append(missing, "AuthEndpoint")
++	}
++	if model.SafeDereference(settings.TokenEndpoint) == "" {
++		missing = append(missing, "TokenEndpoint")
++	}
++	if model.SafeDereference(settings.UserAPIEndpoint) == "" {
++		missing = append(missing, "UserAPIEndpoint")
++	}
++
++	if len(missing) > 0 {
++		return fmt.Errorf("the %q service is misconfigured, the following settings are empty and could not be discovered: %s", service, strings.Join(missing, ", "))
++	}
++
++	// Every endpoint has to be https, however it was resolved. See
++	// validateHTTPSURL for why nothing here is safe without it.
++	for _, endpoint := range []struct {
++		name  string
++		value string
++	}{
++		{"AuthEndpoint", model.SafeDereference(settings.AuthEndpoint)},
++		{"TokenEndpoint", model.SafeDereference(settings.TokenEndpoint)},
++		{"UserAPIEndpoint", model.SafeDereference(settings.UserAPIEndpoint)},
++	} {
++		if _, err := validateHTTPSURL(endpoint.value); err != nil {
++			return fmt.Errorf("the %s of the %q service is invalid: %w", endpoint.name, service, err)
++		}
++	}
++
++	return nil
++}
++
++// IsSameUser reports whether both users are the same account of the same
++// identity provider.
++//
++// The service has to match as well as the subject. App.CreateOAuthUser calls
++// this to decide whether an existing account found by email address may be
++// converted to the incoming SSO identity, and an LDAP or SAML account whose
++// AuthData happens to equal an OpenID Connect subject must not be.
++func (p *OpenIDProvider) IsSameUser(_ request.CTX, dbUser, oAuthUser *model.User) bool {
++	if dbUser == nil || oAuthUser == nil || dbUser.AuthData == nil || oAuthUser.AuthData == nil {
++		return false
++	}
++
++	if *dbUser.AuthData == "" || *oAuthUser.AuthData == "" {
++		return false
++	}
++
++	// The caller fills in AuthService with the service it was invoked with, see
++	// userFromOpenIDUser.
++	if dbUser.AuthService == "" || dbUser.AuthService != oAuthUser.AuthService {
++		return false
++	}
++
++	return *dbUser.AuthData == *oAuthUser.AuthData
++}
++
++// GetUserFromIdToken decodes the claims of the id_token returned by the token
++// endpoint.
++//
++// The signature is NOT verified, see the comment on parseIDToken for why that
++// is acceptable here and for the compensating checks performed by
++// GetUserFromJSON. The registered time based claims and the presence of "sub"
++// are validated.
++func (p *OpenIDProvider) GetUserFromIdToken(rctx request.CTX, idToken string) (*model.User, error) {
++	if strings.TrimSpace(idToken) == "" {
++		return nil, nil
++	}
++
++	claims, err := parseIDToken(idToken, time.Now())
++	if err != nil {
++		return nil, err
++	}
++
++	verified, asserted, err := claims.isEmailVerified()
++	if err != nil {
++		return nil, err
++	}
++	if claims.Email != "" && asserted && !verified {
++		return nil, errors.New("the identity provider reports the email address in the ID token as unverified")
++	}
++
++	user := &model.User{
++		Email:    strings.ToLower(claims.Email),
++		Nickname: claims.Nickname,
++		AuthData: model.NewPointer(string(claims.Subject)),
++	}
++	user.FirstName, user.LastName = namesFrom(&claims.OpenIDUser)
++
++	// The username is deliberately not derived here. It is only ever taken from
++	// the userinfo response, and deriving it would emit a warning for tokens
++	// that carry no usable claim.
++
++	return user, nil
++}
+diff --git a/server/channels/app/oauthproviders/openid/openid_test.go b/server/channels/app/oauthproviders/openid/openid_test.go
+new file mode 100644
+index 00000000..a8f30dde
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/openid_test.go
+@@ -0,0 +1,514 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++package oauthopenid
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/mattermost/mattermost/server/public/model"
++	"github.com/mattermost/mattermost/server/public/shared/request"
++	"github.com/mattermost/mattermost/server/v8/einterfaces"
++)
++
++func TestRegistered(t *testing.T) {
++	require.NotNil(t, einterfaces.GetOAuthProvider(model.ServiceOpenid))
++}
++
++func TestGetUserFromJSON(t *testing.T) {
++	rctx := request.TestContext(t)
++	provider := New()
++
++	t.Run("standard claims", func(t *testing.T) {
++		body := `{
++			"sub": "abc-123",
++			"email": "Jane.Doe@Example.COM",
++			"email_verified": true,
++			"preferred_username": "jdoe",
++			"name": "Jane Doe",
++			"given_name": "Jane",
++			"family_name": "Doe",
++			"nickname": "janey"
++		}`
++
++		user, err := provider.GetUserFromJSON(rctx, strings.NewReader(body), nil, nil)
++		require.NoError(t, err)
++		assert.Equal(t, "abc-123", *user.AuthData)
++		assert.Equal(t, "jane.doe@example.com", user.Email)
++		assert.Equal(t, "Jane", user.FirstName)
++		assert.Equal(t, "Doe", user.LastName)
++		assert.Equal(t, "janey", user.Nickname)
++		// UsePreferredUsername is off, so the local part of the email wins.
++		assert.Equal(t, "jane.doe", user.Username)
++		assert.Empty(t, user.AuthService, "the caller fills in the service")
++	})
++
++	t.Run("preferred username honoured when enabled", func(t *testing.T) {
++		body := `{"sub":"1","email":"jane.doe@example.com","preferred_username":"jdoe@example.com"}`
++		settings := &model.SSOSettings{UsePreferredUsername: model.NewPointer(true)}
++
++		user, err := provider.GetUserFromJSON(rctx, strings.NewReader(body), nil, settings)
++		require.NoError(t, err)
++		assert.Equal(t, "jdoe", user.Username)
++	})
++
++	t.Run("name split when discrete claims are missing", func(t *testing.T) {
++		body := `{"sub":"1","email":"a@b.com","name":"Jan van der Berg"}`
++
++		user, err := provider.GetUserFromJSON(rctx, strings.NewReader(body), nil, nil)
++		require.NoError(t, err)
++		assert.Equal(t, "Jan", user.FirstName)
++		assert.Equal(t, "van der Berg", user.LastName)
++	})
++
++	t.Run("single word name", func(t *testing.T) {
++		body := `{"sub":"1","email":"a@b.com","name":"Prince"}`
++
++		user, err := provider.GetUserFromJSON(rctx, strings.NewReader(body), nil, nil)
++		require.NoError(t, err)
++		assert.Equal(t, "Prince", user.FirstName)
++		assert.Empty(t, user.LastName)
++	})
++
++	t.Run("missing sub is rejected", func(t *testing.T) {
++		_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"email":"a@b.com"}`), nil, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "sub")
++	})
++
++	t.Run("missing email is rejected", func(t *testing.T) {
++		_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"1"}`), nil, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "email")
++	})
++
++	t.Run("invalid json is rejected", func(t *testing.T) {
++		_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`not json`), nil, nil)
++		require.Error(t, err)
++	})
++
++	t.Run("id token subject must match the userinfo subject", func(t *testing.T) {
++		tokenUser := &model.User{AuthData: model.NewPointer("someone-else")}
++
++		_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"abc","email":"a@b.com"}`), tokenUser, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "does not match")
++	})
++
++	t.Run("the id token only fills in cosmetic claims", func(t *testing.T) {
++		tokenUser := &model.User{
++			AuthData:  model.NewPointer("abc"),
++			Email:     "fromtoken@example.com",
++			FirstName: "Token",
++			LastName:  "User",
++			Nickname:  "tok",
++		}
++
++		user, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"abc","email":"real@example.com","given_name":"Real"}`), tokenUser, nil)
++		require.NoError(t, err)
++		assert.Equal(t, "real@example.com", user.Email)
++		assert.Equal(t, "Real", user.FirstName)
++		assert.Equal(t, "tok", user.Nickname)
++	})
++
++	t.Run("the email is never taken from the id token", func(t *testing.T) {
++		tokenUser := &model.User{AuthData: model.NewPointer("abc"), Email: "fromtoken@example.com"}
++
++		// The ID token is not signature verified, so a userinfo response without
++		// an email address must fail rather than borrow the address from it.
++		_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"abc"}`), tokenUser, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "email")
++	})
++
++	t.Run("userinfo without a subject is rejected", func(t *testing.T) {
++		tokenUser := &model.User{AuthData: model.NewPointer("abc")}
++
++		_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"email":"a@b.com"}`), tokenUser, nil)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "sub")
++	})
++}
++
++func TestSubjectClaim(t *testing.T) {
++	rctx := request.TestContext(t)
++	provider := New()
++
++	t.Run("accepted", func(t *testing.T) {
++		for _, tc := range []struct{ name, sub, expected string }{
++			{"string", `"abc-123"`, "abc-123"},
++			{"number", `12345`, "12345"},
++			{"large number keeps its digits", `123456789012345678901234567890`, "123456789012345678901234567890"},
++			{"surrounding whitespace is trimmed", `"  abc  "`, "abc"},
++		} {
++			t.Run(tc.name, func(t *testing.T) {
++				user, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":`+tc.sub+`,"email":"a@b.com"}`), nil, nil)
++				require.NoError(t, err)
++				assert.Equal(t, tc.expected, *user.AuthData)
++			})
++		}
++	})
++
++	t.Run("rejected", func(t *testing.T) {
++		// Anything but a string or a number would otherwise land in AuthData as
++		// raw JSON and become the identity of the account.
++		for _, tc := range []struct{ name, sub string }{
++			{"object", `{"id":"abc"}`},
++			{"array", `["abc"]`},
++			{"boolean", `true`},
++			{"whitespace only string", `"   "`},
++		} {
++			t.Run(tc.name, func(t *testing.T) {
++				_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":`+tc.sub+`,"email":"a@b.com"}`), nil, nil)
++				require.Error(t, err)
++			})
++		}
++	})
++}
++
++func TestEmailVerifiedClaim(t *testing.T) {
++	rctx := request.TestContext(t)
++	provider := New()
++
++	t.Run("accepted", func(t *testing.T) {
++		for _, claim := range []string{`true`, `"true"`, `"TRUE"`, `"True"`, `"t"`, `1`, `"1"`} {
++			t.Run(claim, func(t *testing.T) {
++				user, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"1","email":"a@b.com","email_verified":`+claim+`}`), nil, nil)
++				require.NoError(t, err)
++				assert.Equal(t, "a@b.com", user.Email)
++			})
++		}
++	})
++
++	t.Run("rejected", func(t *testing.T) {
++		// Every one of these is the provider saying the address is not verified.
++		for _, claim := range []string{`false`, `"false"`, `"FALSE"`, `"False"`, `"f"`, `0`, `"0"`} {
++			t.Run(claim, func(t *testing.T) {
++				_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"1","email":"a@b.com","email_verified":`+claim+`}`), nil, nil)
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), "unverified")
++			})
++		}
++	})
++
++	t.Run("an unreadable claim is rejected", func(t *testing.T) {
++		for _, claim := range []string{`"maybe"`, `""`, `{}`, `[]`} {
++			t.Run(claim, func(t *testing.T) {
++				_, err := provider.GetUserFromJSON(rctx, strings.NewReader(`{"sub":"1","email":"a@b.com","email_verified":`+claim+`}`), nil, nil)
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), "email_verified")
++			})
++		}
++	})
++
++	t.Run("an absent claim does not block the login", func(t *testing.T) {
++		for _, body := range []string{`{"sub":"1","email":"a@b.com"}`, `{"sub":"1","email":"a@b.com","email_verified":null}`} {
++			user, err := provider.GetUserFromJSON(rctx, strings.NewReader(body), nil, nil)
++			require.NoError(t, err)
++			assert.Equal(t, "a@b.com", user.Email)
++		}
++	})
++}
++
++func TestUsernameDerivation(t *testing.T) {
++	rctx := request.TestContext(t)
++	usePreferred := &model.SSOSettings{UsePreferredUsername: model.NewPointer(true)}
++
++	for _, tc := range []struct {
++		name     string
++		user     OpenIDUser
++		settings *model.SSOSettings
++		expected string
++	}{
++		{"email local part", OpenIDUser{Subject: "1", Email: "jane.doe@example.com"}, nil, "jane.doe"},
++		{"preferred username", OpenIDUser{Subject: "1", Email: "a@b.com", PreferredUsername: "Jane.Doe"}, usePreferred, "jane.doe"},
++		{"preferred username stripped of the domain", OpenIDUser{Subject: "1", PreferredUsername: "jane@example.com"}, usePreferred, "jane"},
++		{"illegal characters replaced", OpenIDUser{Subject: "1", Email: "jane+tag(x)@example.com"}, nil, "jane-tag-x"},
++		{"uppercase folded", OpenIDUser{Subject: "1", Email: "JANE@example.com"}, nil, "jane"},
++		{"spaces become dashes", OpenIDUser{Subject: "1", Name: "Jane Doe"}, nil, "jane-doe"},
++		{"preferred username used when email is absent", OpenIDUser{Subject: "1", PreferredUsername: "jdoe"}, nil, "jdoe"},
++		{"nickname used when nothing better exists", OpenIDUser{Subject: "1", Nickname: "janey"}, nil, "janey"},
++		{"subject as the last resort", OpenIDUser{Subject: "abc-123"}, nil, "abc-123"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			assert.Equal(t, tc.expected, usernameFrom(rctx.Logger(), &tc.user, tc.settings))
++		})
++	}
++
++	t.Run("unusable claims still produce a valid username", func(t *testing.T) {
++		username := usernameFrom(rctx.Logger(), &OpenIDUser{Subject: "!!!"}, nil)
++		assert.True(t, model.IsValidUsername(username), "got %q", username)
++	})
++}
++
++func TestIsSameUser(t *testing.T) {
++	rctx := request.TestContext(t)
++	provider := New()
++
++	oidcUser := func(authData string) *model.User {
++		return &model.User{AuthData: model.NewPointer(authData), AuthService: model.ServiceOpenid}
++	}
++
++	t.Run("the same subject of the same service", func(t *testing.T) {
++		assert.True(t, provider.IsSameUser(rctx, oidcUser("a"), oidcUser("a")))
++	})
++
++	t.Run("a different subject", func(t *testing.T) {
++		assert.False(t, provider.IsSameUser(rctx, oidcUser("a"), oidcUser("b")))
++	})
++
++	t.Run("an account of another auth service is never the same user", func(t *testing.T) {
++		// App.CreateOAuthUser uses this to decide whether an existing account
++		// found by email may be converted to the incoming SSO identity. An LDAP
++		// or SAML account whose AuthData happens to equal an OpenID Connect
++		// subject must not be taken over.
++		for _, service := range []string{
++			model.UserAuthServiceLdap,
++			model.UserAuthServiceSaml,
++			model.ServiceGitlab,
++			model.ServiceGoogle,
++			"",
++		} {
++			dbUser := &model.User{AuthData: model.NewPointer("a"), AuthService: service}
++			assert.False(t, provider.IsSameUser(rctx, dbUser, oidcUser("a")), "service %q", service)
++		}
++	})
++
++	t.Run("empty auth data", func(t *testing.T) {
++		assert.False(t, provider.IsSameUser(rctx, oidcUser(""), oidcUser("")))
++		assert.False(t, provider.IsSameUser(rctx, oidcUser("a"), oidcUser("")))
++	})
++
++	t.Run("missing users or auth data", func(t *testing.T) {
++		assert.False(t, provider.IsSameUser(rctx, &model.User{AuthService: model.ServiceOpenid}, oidcUser("a")))
++		assert.False(t, provider.IsSameUser(rctx, nil, oidcUser("a")))
++		assert.False(t, provider.IsSameUser(rctx, oidcUser("a"), nil))
++	})
++}
++
++func TestGetSSOSettings(t *testing.T) {
++	rctx := request.TestContext(t)
++
++	newConfig := func() *model.Config {
++		cfg := &model.Config{}
++		cfg.SetDefaults()
++		return cfg
++	}
++
++	fill := func(s *model.SSOSettings) {
++		s.Enable = model.NewPointer(true)
++		s.Id = model.NewPointer("client-id")
++		s.Secret = model.NewPointer("client-secret")
++		s.AuthEndpoint = model.NewPointer("https://idp.example.com/auth")
++		s.TokenEndpoint = model.NewPointer("https://idp.example.com/token")
++		s.UserAPIEndpoint = model.NewPointer("https://idp.example.com/userinfo")
++	}
++
++	t.Run("openid maps to OpenIdSettings", func(t *testing.T) {
++		cfg := newConfig()
++		fill(&cfg.OpenIdSettings)
++
++		settings, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.NoError(t, err)
++		assert.Equal(t, "https://idp.example.com/auth", *settings.AuthEndpoint)
++	})
++
++	t.Run("gitlab maps to GitLabSettings", func(t *testing.T) {
++		cfg := newConfig()
++		fill(&cfg.GitLabSettings)
++		cfg.GitLabSettings.AuthEndpoint = model.NewPointer("https://gitlab.example.com/oauth/authorize")
++
++		settings, err := New().GetSSOSettings(rctx, cfg, model.ServiceGitlab)
++		require.NoError(t, err)
++		assert.Equal(t, "https://gitlab.example.com/oauth/authorize", *settings.AuthEndpoint)
++	})
++
++	t.Run("google maps to GoogleSettings", func(t *testing.T) {
++		// App.getSSOProvider routes google here as soon as an administrator puts
++		// "openid" in its scope, so it has to be handled or those logins break.
++		cfg := newConfig()
++		cfg.GoogleSettings.Enable = model.NewPointer(true)
++		cfg.GoogleSettings.Id = model.NewPointer("client-id")
++		cfg.GoogleSettings.Secret = model.NewPointer("client-secret")
++		cfg.GoogleSettings.Scope = model.NewPointer("profile email openid")
++
++		settings, err := New().GetSSOSettings(rctx, cfg, model.ServiceGoogle)
++		require.NoError(t, err)
++		assert.Equal(t, *cfg.GoogleSettings.AuthEndpoint, *settings.AuthEndpoint)
++		assert.Equal(t, *cfg.GoogleSettings.UserAPIEndpoint, *settings.UserAPIEndpoint)
++	})
++
++	t.Run("office365 maps to Office365Settings", func(t *testing.T) {
++		cfg := newConfig()
++		cfg.Office365Settings.Enable = model.NewPointer(true)
++		cfg.Office365Settings.Id = model.NewPointer("client-id")
++		cfg.Office365Settings.Secret = model.NewPointer("client-secret")
++		cfg.Office365Settings.AuthEndpoint = model.NewPointer("https://login.microsoftonline.com/common/oauth2/v2.0/authorize")
++		cfg.Office365Settings.TokenEndpoint = model.NewPointer("https://login.microsoftonline.com/common/oauth2/v2.0/token")
++		cfg.Office365Settings.UserAPIEndpoint = model.NewPointer("https://graph.microsoft.com/v1.0/me")
++
++		settings, err := New().GetSSOSettings(rctx, cfg, model.ServiceOffice365)
++		require.NoError(t, err)
++		assert.Equal(t, "https://graph.microsoft.com/v1.0/me", *settings.UserAPIEndpoint)
++	})
++
++	t.Run("unknown service", func(t *testing.T) {
++		_, err := New().GetSSOSettings(rctx, newConfig(), model.UserAuthServiceSaml)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "not handled")
++	})
++
++	t.Run("disabled service", func(t *testing.T) {
++		cfg := newConfig()
++		fill(&cfg.OpenIdSettings)
++		cfg.OpenIdSettings.Enable = model.NewPointer(false)
++
++		_, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "not enabled")
++	})
++
++	t.Run("misconfigured service", func(t *testing.T) {
++		cfg := newConfig()
++		fill(&cfg.OpenIdSettings)
++		cfg.OpenIdSettings.Secret = model.NewPointer("")
++		cfg.OpenIdSettings.TokenEndpoint = model.NewPointer("")
++
++		_, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "Secret")
++		assert.Contains(t, err.Error(), "TokenEndpoint")
++	})
++
++	t.Run("configured endpoints must use https", func(t *testing.T) {
++		for _, tc := range []struct {
++			name string
++			set  func(*model.SSOSettings)
++		}{
++			{"AuthEndpoint", func(s *model.SSOSettings) { s.AuthEndpoint = model.NewPointer("http://idp.example.com/auth") }},
++			{"TokenEndpoint", func(s *model.SSOSettings) { s.TokenEndpoint = model.NewPointer("http://idp.example.com/token") }},
++			{"UserAPIEndpoint", func(s *model.SSOSettings) { s.UserAPIEndpoint = model.NewPointer("http://idp.example.com/userinfo") }},
++		} {
++			t.Run(tc.name, func(t *testing.T) {
++				cfg := newConfig()
++				fill(&cfg.OpenIdSettings)
++				tc.set(&cfg.OpenIdSettings)
++
++				_, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), tc.name)
++				assert.Contains(t, err.Error(), "https")
++			})
++		}
++	})
++
++	t.Run("an http discovery endpoint is refused", func(t *testing.T) {
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			t.Error("a plain http discovery endpoint must never be contacted")
++			w.WriteHeader(http.StatusInternalServerError)
++		}))
++		defer server.Close()
++
++		cfg := newConfig()
++		cfg.ServiceSettings.AllowedUntrustedInternalConnections = model.NewPointer(allowlistFor(server))
++		cfg.OpenIdSettings.Enable = model.NewPointer(true)
++		cfg.OpenIdSettings.Id = model.NewPointer("client-id")
++		cfg.OpenIdSettings.Secret = model.NewPointer("client-secret")
++		cfg.OpenIdSettings.DiscoveryEndpoint = model.NewPointer(server.URL)
++
++		_, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "https")
++	})
++
++	t.Run("endpoints are filled from discovery and the config is not mutated", func(t *testing.T) {
++		var hits int
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			hits++
++			assert.Equal(t, wellKnownPath, r.URL.Path)
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = w.Write([]byte(discoveryBody(server.URL)))
++		}))
++		defer server.Close()
++
++		cfg := testConfig(server)
++		cfg.OpenIdSettings.Enable = model.NewPointer(true)
++		cfg.OpenIdSettings.Id = model.NewPointer("client-id")
++		cfg.OpenIdSettings.Secret = model.NewPointer("client-secret")
++		cfg.OpenIdSettings.DiscoveryEndpoint = model.NewPointer(server.URL)
++
++		provider := New()
++		settings, err := provider.GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.NoError(t, err)
++		assert.Equal(t, server.URL+"/auth", *settings.AuthEndpoint)
++		assert.Equal(t, server.URL+"/token", *settings.TokenEndpoint)
++		assert.Equal(t, server.URL+"/userinfo", *settings.UserAPIEndpoint)
++		assert.Empty(t, *cfg.OpenIdSettings.AuthEndpoint, "the server configuration must not be mutated")
++
++		// A second call is served from the cache.
++		_, err = provider.GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.NoError(t, err)
++		assert.Equal(t, 1, hits)
++	})
++
++	t.Run("discovery goes through the guarded transport", func(t *testing.T) {
++		var server *httptest.Server
++		server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			t.Error("the discovery endpoint must not be reachable without an allowlist entry")
++			_, _ = w.Write([]byte(discoveryBody(server.URL)))
++		}))
++		defer server.Close()
++
++		// The server listens on a loopback address and the allowlist is empty,
++		// so AllowedUntrustedInternalConnections must block the request.
++		cfg := newConfig()
++		cfg.OpenIdSettings.Enable = model.NewPointer(true)
++		cfg.OpenIdSettings.Id = model.NewPointer("client-id")
++		cfg.OpenIdSettings.Secret = model.NewPointer("client-secret")
++		cfg.OpenIdSettings.DiscoveryEndpoint = model.NewPointer(server.URL)
++
++		_, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "AllowedUntrustedInternalConnections")
++	})
++
++	t.Run("configured endpoints win over discovery", func(t *testing.T) {
++		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			t.Error("discovery must not be fetched when every endpoint is configured")
++			w.WriteHeader(http.StatusInternalServerError)
++		}))
++		defer server.Close()
++
++		cfg := testConfig(server)
++		fill(&cfg.OpenIdSettings)
++		cfg.OpenIdSettings.DiscoveryEndpoint = model.NewPointer(server.URL)
++
++		settings, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.NoError(t, err)
++		assert.Equal(t, "https://idp.example.com/token", *settings.TokenEndpoint)
++	})
++
++	t.Run("discovery failure is reported", func(t *testing.T) {
++		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++			w.WriteHeader(http.StatusNotFound)
++		}))
++		defer server.Close()
++
++		cfg := testConfig(server)
++		cfg.OpenIdSettings.Enable = model.NewPointer(true)
++		cfg.OpenIdSettings.Id = model.NewPointer("client-id")
++		cfg.OpenIdSettings.Secret = model.NewPointer("client-secret")
++		cfg.OpenIdSettings.DiscoveryEndpoint = model.NewPointer(server.URL)
++
++		_, err := New().GetSSOSettings(rctx, cfg, model.ServiceOpenid)
++		require.Error(t, err)
++		assert.Contains(t, err.Error(), "404")
++	})
++}
+diff --git a/server/channels/app/oauthproviders/openid/register.go b/server/channels/app/oauthproviders/openid/register.go
+new file mode 100644
+index 00000000..4283ce66
+--- /dev/null
++++ b/server/channels/app/oauthproviders/openid/register.go
+@@ -0,0 +1,18 @@
++// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++//go:build !enterprise
++
++package oauthopenid
++
++import (
++	"github.com/mattermost/mattermost/server/public/model"
++	"github.com/mattermost/mattermost/server/v8/einterfaces"
++)
++
++// Enterprise builds register their own OpenID Connect provider from
++// github.com/mattermost/enterprise/oauth/openid, so this one only takes the
++// "openid" service name when that module is not compiled in.
++func init() {
++	einterfaces.RegisterOAuthProvider(model.ServiceOpenid, New())
++}
+diff --git a/server/cmd/mattermost/main.go b/server/cmd/mattermost/main.go
+index 5fb4b4a0..38eb1a2f 100644
+--- a/server/cmd/mattermost/main.go
++++ b/server/cmd/mattermost/main.go
+@@ -11,6 +11,7 @@ import (
+ 	_ "github.com/mattermost/mattermost/server/v8/channels/app/slashcommands"
+ 	// Plugins
+ 	_ "github.com/mattermost/mattermost/server/v8/channels/app/oauthproviders/gitlab"
++	_ "github.com/mattermost/mattermost/server/v8/channels/app/oauthproviders/openid"
+ 
+ 	// Enterprise Imports
+ 	_ "github.com/mattermost/mattermost/server/v8/enterprise"

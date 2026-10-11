@@ -1,0 +1,115 @@
+diff --git a/webapp/channels/src/components/login/login.tsx b/webapp/channels/src/components/login/login.tsx
+index a826eb39..8a93b2bd 100644
+--- a/webapp/channels/src/components/login/login.tsx
++++ b/webapp/channels/src/components/login/login.tsx
+@@ -42,7 +42,7 @@ import EntraIdIcon from 'components/widgets/icons/entra_id_icon';
+ import LockIcon from 'components/widgets/icons/lock_icon';
+ import LoginGitlabIcon from 'components/widgets/icons/login_gitlab_icon';
+ import LoginGoogleIcon from 'components/widgets/icons/login_google_icon';
+-import LoginOpenIDIcon from 'components/widgets/icons/login_openid_icon';
++import OpenIdButtonIcon from 'components/widgets/icons/openid_button_icon';
+ import Input, {SIZE} from 'components/widgets/inputs/input/input';
+ import PasswordInput from 'components/widgets/inputs/password_input/password_input';
+ 
+@@ -95,6 +95,7 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+         GitLabButtonColor,
+         OpenIdButtonText,
+         OpenIdButtonColor,
++        OpenIdDiscoveryEndpoint,
+         SamlLoginButtonText,
+         EnableCustomBrand,
+         CustomBrandText,
+@@ -198,7 +199,7 @@ const Login = ({onCustomizeHeader}: LoginProps) => {
+             externalLoginOptions.push({
+                 id: 'openid',
+                 url,
+-                icon: <LoginOpenIDIcon/>,
++                icon: <OpenIdButtonIcon discoveryEndpoint={OpenIdDiscoveryEndpoint}/>,
+                 label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+                 style: {color: OpenIdButtonColor, borderColor: OpenIdButtonColor},
+                 onClick: handleExternalAuth(url, 'openid'),
+diff --git a/webapp/channels/src/components/signup/signup.tsx b/webapp/channels/src/components/signup/signup.tsx
+index 139239d2..da5a99be 100644
+--- a/webapp/channels/src/components/signup/signup.tsx
++++ b/webapp/channels/src/components/signup/signup.tsx
+@@ -42,7 +42,7 @@ import EntraIdIcon from 'components/widgets/icons/entra_id_icon';
+ import LockIcon from 'components/widgets/icons/lock_icon';
+ import LoginGitlabIcon from 'components/widgets/icons/login_gitlab_icon';
+ import LoginGoogleIcon from 'components/widgets/icons/login_google_icon';
+-import LoginOpenIDIcon from 'components/widgets/icons/login_openid_icon';
++import OpenIdButtonIcon from 'components/widgets/icons/openid_button_icon';
+ import CheckInput from 'components/widgets/inputs/check';
+ import Input, {SIZE} from 'components/widgets/inputs/input/input';
+ import type {CustomMessageInputType} from 'components/widgets/inputs/input/input';
+@@ -96,6 +96,7 @@ const Signup = ({onCustomizeHeader}: SignupProps) => {
+         GitLabButtonColor,
+         OpenIdButtonText,
+         OpenIdButtonColor,
++        OpenIdDiscoveryEndpoint,
+         EnableCustomBrand,
+         CustomBrandText,
+         TermsOfServiceLink,
+@@ -195,7 +196,7 @@ const Signup = ({onCustomizeHeader}: SignupProps) => {
+             externalLoginOptions.push({
+                 id: 'openid',
+                 url,
+-                icon: <LoginOpenIDIcon/>,
++                icon: <OpenIdButtonIcon discoveryEndpoint={OpenIdDiscoveryEndpoint}/>,
+                 label: OpenIdButtonText || formatMessage({id: 'login.openid', defaultMessage: 'Open ID'}),
+                 style: {color: OpenIdButtonColor, borderColor: OpenIdButtonColor},
+                 onClick: desktopExternalAuth(url),
+diff --git a/server/config/client.go b/server/config/client.go
+--- a/server/config/client.go
++++ b/server/config/client.go
+@@ -378,6 +378,7 @@ func GenerateLimitedClientConfig(c *model.Config, telemetryID string, license *
+ 	props["EnableSignUpWithOpenId"] = strconv.FormatBool(*c.OpenIdSettings.Enable)
+ 	props["OpenIdButtonColor"] = *c.OpenIdSettings.ButtonColor
+ 	props["OpenIdButtonText"] = *c.OpenIdSettings.ButtonText
++	props["OpenIdDiscoveryEndpoint"] = *c.OpenIdSettings.DiscoveryEndpoint
+ 	props["EnableCustomBrand"] = strconv.FormatBool(*c.TeamSettings.EnableCustomBrand)
+ 	props["CustomBrandText"] = *c.TeamSettings.CustomBrandText
+ 	props["CustomDescriptionText"] = *c.TeamSettings.CustomDescriptionText
+diff --git a/webapp/platform/types/src/config.ts b/webapp/platform/types/src/config.ts
+--- a/webapp/platform/types/src/config.ts
++++ b/webapp/platform/types/src/config.ts
+@@ -173,6 +173,7 @@
+     GitLabButtonText: string;
+     GitLabButtonColor: string;
+     OpenIdButtonText: string;
+     OpenIdButtonColor: string;
++    OpenIdDiscoveryEndpoint: string;
+     PasswordEnableForgotLink: string;
+     PasswordMinimumLength: string;
+     PasswordRequireLowercase: string;
+diff --git a/webapp/channels/src/components/widgets/icons/openid_button_icon.tsx b/webapp/channels/src/components/widgets/icons/openid_button_icon.tsx
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/webapp/channels/src/components/widgets/icons/openid_button_icon.tsx
++// Copyright (c) 2026-present Mattermore contributors. All Rights Reserved.
++// See LICENSE.txt for license information.
++
++import React from 'react';
++
++import EntraIdIcon from 'components/widgets/icons/entra_id_icon';
++import LoginGoogleIcon from 'components/widgets/icons/login_google_icon';
++import LoginOpenIDIcon from 'components/widgets/icons/login_openid_icon';
++
++type Props = React.HTMLAttributes<HTMLSpanElement> & {
++    // The provider's discovery endpoint, used to pick the matching mark.
++    // Google and Entra keep their own artwork; anything else (including an
++    // identity broker in front of both) falls back to the generic OpenID mark.
++    discoveryEndpoint?: string;
++};
++
++export default function OpenIdButtonIcon(props: Props) {
++    const {discoveryEndpoint, ...rest} = props;
++    const endpoint = (discoveryEndpoint || '').toLowerCase();
++    if (endpoint.includes('accounts.google.com')) {
++        return <LoginGoogleIcon {...rest}/>;
++    }
++    if (endpoint.includes('login.microsoftonline.com') || endpoint.includes('login.windows.net') || endpoint.includes('/adfs/')) {
++        return <EntraIdIcon {...rest}/>;
++    }
++    return <LoginOpenIDIcon {...rest}/>;
++};

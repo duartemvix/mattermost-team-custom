@@ -1,0 +1,251 @@
+From c3e3f50ee4b2b54756deb11892094562886d0a1f Mon Sep 17 00:00:00 2001
+From: Dennis Klappe <dennisklappe@gmail.com>
+Date: Tue, 8 Sep 2026 14:19:40 +0200
+Subject: [PATCH] Lift the licence gate on guest accounts in the web app
+
+The server side (patch 0011) makes guest accounts follow
+GuestAccountsSettings.Enable alone, but the web app still hid or upsold every
+entry point, so the feature was unreachable. Removes the licence checks at:
+
+  admin_console/admin_definition.tsx
+      Guest Access renders the real settings page; the feature-discovery
+      upsell that replaced it is dropped.
+  permission_schemes_settings/permission_system_scheme_settings
+  permission_schemes_settings/permission_team_scheme_settings
+      the Guests permission panel follows EnableGuestAccounts alone.
+  channel_invite_modal/index.ts
+      canInviteGuests keys off BuildEnterpriseReady, matching invitation_modal.
+  invitation_modal/invite_as.tsx
+      only a cloud starter plan still restricts the Guest option; an
+      unlicensed self-hosted server no longer gets the upsell badge.
+  admin_console/system_users/system_users_list_actions
+      "Demote to guest" follows GuestAccountsSettings.Enable.
+
+The two invite_as tests that asserted the self-hosted starter upsell now
+assert the opposite.
+
+See https://mattermore.dev/guest-accounts
+---
+ .../admin_console/admin_definition.tsx        | 30 +++----------------
+ .../permission_system_scheme_settings.tsx     |  4 +--
+ .../permission_team_scheme_settings.tsx       |  3 +-
+ .../system_users_list_actions/index.tsx       |  5 ++--
+ .../components/channel_invite_modal/index.ts  |  6 ++--
+ .../invitation_modal/invite_as.test.tsx       | 13 ++++----
+ .../components/invitation_modal/invite_as.tsx | 10 +++----
+ 7 files changed, 25 insertions(+), 46 deletions(-)
+
+diff --git a/webapp/channels/src/components/admin_console/admin_definition.tsx b/webapp/channels/src/components/admin_console/admin_definition.tsx
+index acc04a91..3a361f18 100644
+--- a/webapp/channels/src/components/admin_console/admin_definition.tsx
++++ b/webapp/channels/src/components/admin_console/admin_definition.tsx
+@@ -81,7 +81,6 @@ import {
+     DataRetentionFeatureDiscovery,
+     GitLabFeatureDiscovery,
+     GroupsFeatureDiscovery,
+-    GuestAccessFeatureDiscovery,
+     LDAPFeatureDiscovery,
+     MobileSecurityFeatureDiscovery,
+     OpenIDCustomFeatureDiscovery,
+@@ -5832,10 +5831,10 @@ const AdminDefinition: AdminDefinitionType = {
+                 url: 'authentication/guest_access',
+                 title: defineMessage({id: 'admin.sidebar.guest_access', defaultMessage: 'Guest Access'}),
+                 searchableStrings: magicLinkSearchableStrings,
+-                isHidden: it.any(
+-                    it.not(it.licensedForFeature('GuestAccounts')),
+-                    it.not(it.userHasReadPermissionOnResource(RESOURCE_KEYS.AUTHENTICATION.GUEST_ACCESS)),
+-                ),
++
++                // Guest accounts are not licence-gated, so only the admin's own
++                // read permission decides whether the page shows.
++                isHidden: it.not(it.userHasReadPermissionOnResource(RESOURCE_KEYS.AUTHENTICATION.GUEST_ACCESS)),
+                 schema: {
+                     id: 'GuestAccountsSettings',
+                     name: defineMessage({id: 'admin.authentication.guest_access', defaultMessage: 'Guest Access'}),
+@@ -5916,27 +5915,6 @@ const AdminDefinition: AdminDefinitionType = {
+                 },
+                 restrictedIndicator: getRestrictedIndicator(),
+             },
+-            guest_access_feature_discovery: {
+-                isDiscovery: true,
+-                url: 'authentication/guest_access',
+-                title: defineMessage({id: 'admin.sidebar.guest_access', defaultMessage: 'Guest Access'}),
+-                isHidden: it.any(
+-                    it.licensedForFeature('GuestAccounts'),
+-                ),
+-                schema: {
+-                    id: 'GuestAccountsSettings',
+-                    name: defineMessage({id: 'admin.authentication.guest_access', defaultMessage: 'Guest Access'}),
+-                    settings: [
+-                        {
+-                            type: 'custom',
+-                            component: GuestAccessFeatureDiscovery,
+-                            key: 'GuestAccessFeatureDiscovery',
+-                            isDisabled: it.not(it.userHasWritePermissionOnResource(RESOURCE_KEYS.ABOUT.EDITION_AND_LICENSE)),
+-                        },
+-                    ],
+-                },
+-                restrictedIndicator: getRestrictedIndicator(true),
+-            },
+         },
+     },
+     plugins: {
+diff --git a/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_system_scheme_settings/permission_system_scheme_settings.tsx b/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_system_scheme_settings/permission_system_scheme_settings.tsx
+index 77021deb..d836d0bd 100644
+--- a/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_system_scheme_settings/permission_system_scheme_settings.tsx
++++ b/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_system_scheme_settings/permission_system_scheme_settings.tsx
+@@ -387,7 +387,6 @@ export class PermissionSystemSchemeSettings extends React.PureComponent<Props, S
+             return <LoadingScreen/>;
+         }
+ 
+-        const isLicensed = this.props.license?.IsLicensed === 'true';
+         return (
+             <div className='wrapper--fixed'>
+                 <AdminHeader withBackButton={true}>
+@@ -426,7 +425,8 @@ export class PermissionSystemSchemeSettings extends React.PureComponent<Props, S
+                             </div>
+                         </div>
+ 
+-                        {isLicensed && this.props.config.EnableGuestAccounts === 'true' &&
++                        {/* Guest accounts are not licence-gated, so the config setting alone decides. */}
++                        {this.props.config.EnableGuestAccounts === 'true' &&
+                             <AdminPanelTogglable
+                                 className='permissions-block'
+                                 open={this.state.openRoles.guests}
+diff --git a/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_team_scheme_settings/permission_team_scheme_settings.tsx b/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_team_scheme_settings/permission_team_scheme_settings.tsx
+index 135d11a9..a37c3941 100644
+--- a/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_team_scheme_settings/permission_team_scheme_settings.tsx
++++ b/webapp/channels/src/components/admin_console/permission_schemes_settings/permission_team_scheme_settings/permission_team_scheme_settings.tsx
+@@ -713,7 +713,8 @@ export default class PermissionTeamSchemeSettings extends React.PureComponent<Pr
+                             </div>
+                         </AdminPanelWithButton>
+ 
+-                        {this.props.license && this.props.config.EnableGuestAccounts === 'true' &&
++                        {/* Guest accounts are not licence-gated, so the config setting alone decides. */}
++                        {this.props.config.EnableGuestAccounts === 'true' &&
+                             <AdminPanelTogglable
+                                 className='permissions-block'
+                                 open={this.state.openRoles.guests}
+diff --git a/webapp/channels/src/components/admin_console/system_users/system_users_list_actions/index.tsx b/webapp/channels/src/components/admin_console/system_users/system_users_list_actions/index.tsx
+index de1e3841..3289d780 100644
+--- a/webapp/channels/src/components/admin_console/system_users/system_users_list_actions/index.tsx
++++ b/webapp/channels/src/components/admin_console/system_users/system_users_list_actions/index.tsx
+@@ -13,7 +13,6 @@ import {updateUserActive} from 'mattermost-redux/actions/users';
+ import {Permissions} from 'mattermost-redux/constants';
+ import General from 'mattermost-redux/constants/general';
+ import {getConfig} from 'mattermost-redux/selectors/entities/admin';
+-import {getLicense} from 'mattermost-redux/selectors/entities/general';
+ import {haveISystemPermission} from 'mattermost-redux/selectors/entities/roles_helpers';
+ import {isSystemAdmin, isGuest} from 'mattermost-redux/utils/user_utils';
+ 
+@@ -55,7 +54,6 @@ export function SystemUsersListAction({user, currentUser, tableId, rowIndex, onE
+     const {formatMessage} = useIntl();
+     const dispatch = useDispatch();
+     const config = useSelector(getConfig);
+-    const isLicensed = useSelector(getLicense)?.IsLicensed === 'true';
+     const haveSysConsoleWriteUserManagementUsersPermissions = useSelector((state: GlobalState) => haveISystemPermission(state, {permission: Permissions.SYSCONSOLE_WRITE_USERMANAGEMENT_USERS}));
+     const showManageUserSettings = useSelector(getShowManageUserSettings);
+ 
+@@ -505,7 +503,8 @@ export function SystemUsersListAction({user, currentUser, tableId, rowIndex, onE
+                     onClick={handlePromoteToMemberClick}
+                 />
+             }
+-            {!isGuest(user.roles) && user.id !== currentUser.id && isLicensed && config.GuestAccountsSettings?.Enable &&
++            {/* Guest accounts are not licence-gated, so the config setting alone decides. */}
++            {!isGuest(user.roles) && user.id !== currentUser.id && config.GuestAccountsSettings?.Enable &&
+                 <Menu.Item
+                     id={`${menuItemIdPrefix}-demoteToGuest`}
+                     labels={
+diff --git a/webapp/channels/src/components/channel_invite_modal/index.ts b/webapp/channels/src/components/channel_invite_modal/index.ts
+index 0ad8f27d..e8280d3e 100644
+--- a/webapp/channels/src/components/channel_invite_modal/index.ts
++++ b/webapp/channels/src/components/channel_invite_modal/index.ts
+@@ -86,9 +86,11 @@ function makeMapStateToProps(initialState: GlobalState, initialProps: OwnProps)
+ 
+         const guestAccountsEnabled = config.EnableGuestAccounts === 'true';
+         const emailInvitationsEnabled = config.EnableEmailInvitations === 'true';
+-        const isLicensed = license && license.IsLicensed === 'true';
++        // Guest accounts are not licence-gated, so match invitation_modal and key off the
++        // build flag instead of IsLicensed.
++        const isEnterpriseReady = config.BuildEnterpriseReady === 'true';
+         const isGroupConstrained = Boolean(currentTeam?.group_constrained);
+-        const canInviteGuests = !isGroupConstrained && isLicensed && guestAccountsEnabled && haveICurrentTeamPermission(state, Permissions.INVITE_GUEST);
++        const canInviteGuests = !isGroupConstrained && isEnterpriseReady && guestAccountsEnabled && haveICurrentTeamPermission(state, Permissions.INVITE_GUEST);
+         const enableCustomUserGroups = isCustomGroupsEnabled(state);
+ 
+         const isGroupsEnabled = enableCustomUserGroups || (license?.IsLicensed === 'true' && license?.LDAPGroups === 'true');
+diff --git a/webapp/channels/src/components/invitation_modal/invite_as.test.tsx b/webapp/channels/src/components/invitation_modal/invite_as.test.tsx
+index aab4ea3f..44b599c4 100644
+--- a/webapp/channels/src/components/invitation_modal/invite_as.test.tsx
++++ b/webapp/channels/src/components/invitation_modal/invite_as.test.tsx
+@@ -182,7 +182,7 @@ describe('components/cloud_start_trial_btn/cloud_start_trial_btn', () => {
+         expect(screen.getByText('Upgrade')).toBeInTheDocument();
+     });
+ 
+-    test('guest radio-button is disabled and shows the badge guest restricted feature to invite guest when is NOT free trial for self hosted starter', () => {
++    test('guest radio-button stays enabled and unbadged for an unlicensed self hosted server', () => {
+         const testState = {
+             entities: {
+                 admin: {
+@@ -213,13 +213,14 @@ describe('components/cloud_start_trial_btn/cloud_start_trial_btn', () => {
+             {useMockedStore: true},
+         );
+ 
++        // Guest accounts are not a paid feature on a self hosted server.
+         const guestRadioButton = screen.getByDisplayValue('GUEST');
+-        expect(guestRadioButton).toBeDisabled();
++        expect(guestRadioButton).toBeEnabled();
+ 
+-        expect(screen.getByText('Professional feature- try it out free')).toBeInTheDocument();
++        expect(screen.queryByText('Professional feature- try it out free')).not.toBeInTheDocument();
+     });
+ 
+-    test('restricted badge shows "Upgrade" for self hosted starter post trial', () => {
++    test('no restricted badge for an unlicensed self hosted server that already had a trial', () => {
+         const testState = {
+             entities: {
+                 admin: {
+@@ -251,9 +252,9 @@ describe('components/cloud_start_trial_btn/cloud_start_trial_btn', () => {
+         );
+ 
+         const guestRadioButton = screen.getByDisplayValue('GUEST');
+-        expect(guestRadioButton).toBeDisabled();
++        expect(guestRadioButton).toBeEnabled();
+ 
+-        expect(screen.getByText('Upgrade')).toBeInTheDocument();
++        expect(screen.queryByText('Upgrade')).not.toBeInTheDocument();
+     });
+ 
+     test('shows the badge guest highligh feature to invite guest when IS FREE trial for cloud', () => {
+diff --git a/webapp/channels/src/components/invitation_modal/invite_as.tsx b/webapp/channels/src/components/invitation_modal/invite_as.tsx
+index 326e8569..e07ce7b1 100644
+--- a/webapp/channels/src/components/invitation_modal/invite_as.tsx
++++ b/webapp/channels/src/components/invitation_modal/invite_as.tsx
+@@ -7,7 +7,7 @@ import {useSelector, useDispatch} from 'react-redux';
+ 
+ import {getPrevTrialLicense} from 'mattermost-redux/actions/admin';
+ import {getSubscriptionProduct, checkHadPriorTrial} from 'mattermost-redux/selectors/entities/cloud';
+-import {getConfig, getLicense} from 'mattermost-redux/selectors/entities/general';
++import {getLicense} from 'mattermost-redux/selectors/entities/general';
+ import {isCurrentUserSystemAdmin} from 'mattermost-redux/selectors/entities/users';
+ 
+ import {closeModal, openModal} from 'actions/views/modals';
+@@ -49,12 +49,10 @@ export default function InviteAs(props: Props) {
+     const subscription = useSelector((state: GlobalState) => state.entities.cloud.subscription);
+     const subscriptionProduct = useSelector(getSubscriptionProduct);
+     const isSystemAdmin = useSelector(isCurrentUserSystemAdmin);
+-    const config = useSelector(getConfig);
+ 
+-    const isCloudStarter = subscriptionProduct?.sku === CloudProducts.STARTER;
+-    const isEnterpriseReady = config.BuildEnterpriseReady === 'true';
+-    const isSelfHostedStarter = isEnterpriseReady && license.IsLicensed === 'false';
+-    const isStarter = isCloudStarter || isSelfHostedStarter;
++    // Guest accounts are not a paid feature on a self-hosted server, so only the
++    // cloud starter plan still restricts them here.
++    const isStarter = subscriptionProduct?.sku === CloudProducts.STARTER;
+ 
+     let extraGuestLegend = true;
+     let guestDisabledClass = '';
+-- 
+2.53.0
+
